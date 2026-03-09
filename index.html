@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<!--
+    tMark — Annotation Utility  |  tbits
+    File   : tmark.html
+    Purpose: HTML structure only — no inline styles or scripts
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>tMark — Annotation Utility | tbits</title>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.1/fabric.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc =
+            'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
+    <link rel="stylesheet" href="annotator.css">
+</head>
+<body>
+
+    <!-- ═══════════════════════════════════ TOPBAR ═══════════════════════════════════ -->
+    <header class="topbar">
+        <div class="brand">
+            <div class="brand-icon">✏</div>
+            tbits<span class="brand-sub">Markup</span>
+        </div>
+        <div class="divider-v"></div>
+
+        <input type="file" id="file-upload" accept="image/png,image/jpeg,image/jpg,application/pdf" style="display:none">
+        <div class="file-pill" onclick="document.getElementById('file-upload').click()" title="Open file (Ctrl+O)">
+            <span class="file-pill-icon">📄</span>
+            <span id="file-name-display">Open a file to begin…</span>
+        </div>
+
+        <div class="divider-v"></div>
+
+        <!-- [FIX 1] User identity pill — shows reviewer name, click to change -->
+        <div class="user-pill" id="user-pill" onclick="promptUserName()" title="Click to change reviewer name">
+            <div class="user-avatar" id="user-avatar">R</div>
+            <span id="user-display-name">Reviewer</span>
+            <span class="user-edit-icon">✎</span>
+        </div>
+
+        <div class="divider-v"></div>
+
+        <nav class="page-nav" id="page-nav" style="display:none">
+            <button class="page-nav-btn" id="btn-prev" onclick="changePage(-1)">‹</button>
+            <span class="page-label" id="page-label">1 / 1</span>
+            <button class="page-nav-btn" id="btn-next" onclick="changePage(1)">›</button>
+        </nav>
+
+        <!-- [FIX 4] Three buttons: Summary · Download · Save -->
+        <!-- <div class="topbar-right">
+            <button class="btn btn-ghost"        id="btn-export-summary" style="font-size:12.5px">📋 Summary</button>
+            <button class="btn btn-outline-blue" id="btn-download"       style="font-size:12.5px">⬇ Download</button>
+            <button class="btn btn-blue"         id="btn-save-server"    style="font-size:12.5px">☁ Save</button>
+        </div> -->
+        <div class="topbar-right">
+    <button class="btn btn-ghost" id="btn-view-json" style="font-size:12.5px">👁️ View JSON</button>
+    <button class="btn btn-ghost" id="btn-download-json" style="font-size:12.5px">📄 Save JSON</button>
+    
+    <button class="btn btn-ghost"        id="btn-export-summary" style="font-size:12.5px">📋 Summary</button>
+    <button class="btn btn-outline-blue" id="btn-download"       style="font-size:12.5px">⬇ Download</button>
+    <button class="btn btn-blue"         id="btn-save-server"    style="font-size:12.5px">☁ Save</button>
+</div>
+        
+    </header>
+
+    <!-- ═══════════════════════════════════ WORKSPACE ═══════════════════════════════════ -->
+    <div class="workspace">
+
+        <!-- LEFT TOOLBAR -->
+        <aside class="toolbar">
+            <div class="tool-btn active" data-tool="select">
+                <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 3l14 9-7 2-2 7L5 3z"/></svg>
+                <span class="tool-tip">Select <kbd>V</kbd></span>
+            </div>
+            <div class="tool-sep"></div>
+            <div class="tool-btn" data-tool="draw">
+                <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5z"/></svg>
+                <span class="tool-tip">Pencil <kbd>P</kbd></span>
+            </div>
+            <div class="tool-btn" data-tool="rect">
+                <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+                <span class="tool-tip">Rectangle <kbd>R</kbd></span>
+            </div>
+            <div class="tool-btn" data-tool="circle">
+                <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/></svg>
+                <span class="tool-tip">Ellipse <kbd>E</kbd></span>
+            </div>
+            <div class="tool-btn" data-tool="arrow">
+                <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="5" y1="19" x2="19" y2="5"/><polyline points="9 5 19 5 19 15"/></svg>
+                <span class="tool-tip">Arrow <kbd>A</kbd></span>
+            </div>
+            <div class="tool-btn" data-tool="line">
+                <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="4" y1="20" x2="20" y2="4"/></svg>
+                <span class="tool-tip">Line <kbd>L</kbd></span>
+            </div>
+            <div class="tool-btn" data-tool="text">
+                <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 7V4h16v3"/><line x1="12" y1="4" x2="12" y2="20"/><line x1="8" y1="20" x2="16" y2="20"/></svg>
+                <span class="tool-tip">Text <kbd>T</kbd></span>
+            </div>
+            <div class="tool-sep"></div>
+            <div class="stroke-group">
+                <div class="stroke-opt active" data-w="1"><span style="height:1px"></span></div>
+                <div class="stroke-opt"        data-w="2"><span style="height:2.5px"></span></div>
+                <div class="stroke-opt"        data-w="4"><span style="height:4px"></span></div>
+            </div>
+            <div class="tool-sep"></div>
+            <div class="tool-btn" id="btn-toolbar-undo" onclick="undoLast()">
+                <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 10h10a5 5 0 0 1 0 10H7"/><polyline points="3 10 7 6 3 2 3 10"/></svg>
+                <span class="tool-tip">Undo <kbd>Ctrl+Z</kbd></span>
+            </div>
+            <div class="tool-btn tool-btn-danger" id="btn-toolbar-delete" onclick="deleteActiveObject()">
+                <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>
+                <span class="tool-tip">Delete selected <kbd>Del</kbd></span>
+            </div>
+        </aside>
+
+        <!-- CANVAS AREA -->
+        <!-- [FIX 5] canvas-area scrolls; scroll-container wraps canvas+badges so they scroll together -->
+        <main class="canvas-area" id="canvas-wrapper">
+            <div id="loader">
+                <div class="loader-track"></div>
+                <div class="loader-text">Processing document…</div>
+            </div>
+
+            <div id="empty-state">
+                <div class="empty-card">
+                    <div class="empty-icon">🗂️</div>
+                    <div class="empty-title">No file loaded</div>
+                    <div class="empty-sub">Open a PDF or image to start annotating.<br>Annotations are embedded into the PDF on export.</div>
+                    <button class="empty-cta" onclick="document.getElementById('file-upload').click()">📁 &nbsp;Browse files</button>
+                    <div class="hint-row">Drag &amp; drop works too &nbsp;·&nbsp; <kbd>Ctrl+O</kbd></div>
+                </div>
+            </div>
+
+            <!-- Scroll container: canvas + badge overlay scroll as one unit -->
+            <div id="scroll-container">
+                <div class="canvas-shadow" id="canvas-shadow">
+                    <canvas id="doc-canvas"></canvas>
+                    <!-- [FIX 2] Badge overlay: number pins rendered absolutely over canvas -->
+                    <div id="anno-badges"></div>
+                </div>
+            </div>
+
+            <div class="zoom-controls">
+                <button class="zoom-btn" onclick="zoomOut()"   title="Zoom out">−</button>
+                <span   class="zoom-level" id="zoom-level">100%</span>
+                <button class="zoom-btn" onclick="zoomIn()"    title="Zoom in">+</button>
+                <button class="zoom-btn" onclick="resetZoom()" title="Reset zoom">⊙</button>
+            </div>
+        </main>
+
+        <!-- RIGHT-CLICK CONTEXT MENU -->
+        <div id="context-menu">
+            <div class="ctx-colors" id="ctx-colors"></div>
+            <div class="ctx-sep"></div>
+            <div class="ctx-item" onclick="editActiveComment()">✏ Edit comment</div>
+            <div class="ctx-item" onclick="duplicateObject()">⧉ Duplicate</div>
+            <div class="ctx-sep"></div>
+            <div class="ctx-item danger" onclick="deleteActiveObject()">🗑 Delete</div>
+        </div>
+
+        <!-- RIGHT SIDEBAR -->
+        <aside class="sidebar">
+            <div class="sidebar-tabs">
+                <button class="sidebar-tab active" data-tab="comments">💬 Comments</button>
+                <button class="sidebar-tab"        data-tab="properties">🎨 Properties</button>
+            </div>
+
+            <!-- COMMENTS TAB -->
+            <div class="tab-panel active" id="tab-comments">
+                <div class="panel-header">
+                    <div class="panel-title">Annotations</div>
+                    <div class="panel-badge" id="comment-count">0</div>
+                </div>
+
+                <div id="comment-input-section">
+                    <div class="input-header">
+                        <span class="input-header-label" id="input-label">New Comment</span>
+                        <button class="close-btn" onclick="cancelInput()">✕</button>
+                    </div>
+                    <textarea id="comment-textarea" rows="4" placeholder="Describe this annotation… (Ctrl+Enter to post)"></textarea>
+                    <div class="input-footer">
+                        <button class="btn btn-ghost btn-sm" id="btn-cancel-input">Cancel</button>
+                        <button class="btn btn-blue  btn-sm" id="btn-post-input">Post</button>
+                    </div>
+                </div>
+
+                <div id="comments-list" class="comments-scroll"></div>
+            </div>
+
+            <!-- PROPERTIES TAB -->
+            <div class="tab-panel" id="tab-properties">
+                <div id="no-sel" class="no-sel">
+                    <div class="no-sel-icon">↖️</div>
+                    <div class="no-sel-text">Select an annotation<br>to edit its properties</div>
+                </div>
+                <div id="props-panel" class="props-scroll" style="display:none">
+                    <div class="prop-sec">
+                        <div class="prop-sec-title">Color</div>
+                        <div class="color-grid" id="props-colors"></div>
+                        <div class="custom-row">
+                            <label for="custom-color">Custom</label>
+                            <input type="color" id="custom-color" value="#3b6ef8">
+                        </div>
+                    </div>
+                    <div class="prop-sec">
+                        <div class="prop-sec-title">Opacity</div>
+                        <div class="slider-row">
+                            <label for="opacity-slider">Opacity</label>
+                            <input type="range" id="opacity-slider" min="10" max="100" value="100">
+                            <span class="slider-val" id="opacity-val">100%</span>
+                        </div>
+                    </div>
+                    <div class="prop-sec">
+                        <div class="prop-sec-title">Stroke</div>
+                        <div class="slider-row">
+                            <label for="stroke-slider">Width</label>
+                            <input type="range" id="stroke-slider" min="1" max="12" value="2">
+                            <span class="slider-val" id="stroke-val">2px</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </aside>
+    </div><!-- /.workspace -->
+
+    <!-- STATUS BAR -->
+    <footer class="statusbar">
+        <div class="status-item"><div class="status-dot"></div>Ready</div>
+        <div class="status-item" id="st-tool">Select</div>
+        <div class="status-item" id="st-dims">—</div>
+        <div class="status-item" id="st-pos">x:— y:—</div>
+        <div class="status-item status-item-right">
+            <!-- [FIX 3] Live annotation JSON counter -->
+            <span id="st-json-count" class="json-pill">{ } 0 annotations</span>
+        </div>
+    </footer>
+
+    <!-- PDF EXPORT PROGRESS OVERLAY -->
+    <div id="progress-bar-wrap">
+        <div class="progress-card">
+            <div class="progress-title" id="progress-title">Processing…</div>
+            <div class="progress-sub"   id="progress-sub">Please wait</div>
+            <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+        </div>
+    </div>
+
+    <!-- [FIX 1] User name modal -->
+    <div id="user-modal" class="modal-overlay" style="display:none">
+        <div class="modal-card">
+            <div class="modal-title">👤 Set Reviewer Name</div>
+            <div class="modal-sub">This name will appear on all annotations and in the exported summary.</div>
+            <input type="text" id="user-name-input" class="modal-input"
+                   placeholder="e.g. Alice Johnson" maxlength="40">
+            <div class="modal-actions">
+                <button class="btn btn-ghost btn-sm" onclick="closeUserModal()">Cancel</button>
+                <button class="btn btn-blue  btn-sm" id="btn-confirm-user" onclick="confirmUserName()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast-container"></div>
+    <script src="annotator.js"></script>
+</body>
+</html>
