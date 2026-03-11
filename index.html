@@ -1,14 +1,9 @@
 <!DOCTYPE html>
-<!--
-    tMark — Annotation Utility  |  tbits
-    File   : tmark.html
-    Purpose: HTML structure only — no inline styles or scripts
--->
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>tMark — Annotation Utility | tbits</title>
+    <title>tBits — Annotation Utility</title>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.1/fabric.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
@@ -21,7 +16,11 @@
     <link rel="stylesheet" href="annotator.css">
 </head>
 <body>
-
+<nav style="background: #1a2140; color: white; padding: 10px; margin-bottom: 20px;">
+    <strong>tbits Portal</strong> | Welcome, 
+    <span id="header-user-name" style="color: #3b6ef8; font-weight: bold;">Nitish</span>
+    <span id="header-user-id" style="display:none;">DEV-007</span>
+</nav>
     <!-- ═══════════════════════════════════ TOPBAR ═══════════════════════════════════ -->
     <header class="topbar">
         <div class="brand">
@@ -36,16 +35,20 @@
             <span id="file-name-display">Open a file to begin…</span>
         </div>
 
-        <div class="divider-v"></div>
+        
 
         <!-- [FIX 1] User identity pill — shows reviewer name, click to change -->
+        <!-- 
+        <div class="divider-v"></div>
         <div class="user-pill" id="user-pill" onclick="promptUserName()" title="Click to change reviewer name">
             <div class="user-avatar" id="user-avatar">R</div>
             <span id="user-display-name">Reviewer</span>
             <span class="user-edit-icon">✎</span>
-        </div>
-
+        </div> 
         <div class="divider-v"></div>
+        -->
+
+      
 
         <nav class="page-nav" id="page-nav" style="display:none">
             <button class="page-nav-btn" id="btn-prev" onclick="changePage(-1)">‹</button>
@@ -252,8 +255,9 @@
         </div>
     </div>
 
-    <!-- [FIX 1] User name modal -->
-    <div id="user-modal" class="modal-overlay" style="display:none">
+   
+    <!-- [FIX 1] User name modal 
+      <div id="user-modal" class="modal-overlay" style="display:none">
         <div class="modal-card">
             <div class="modal-title">👤 Set Reviewer Name</div>
             <div class="modal-sub">This name will appear on all annotations and in the exported summary.</div>
@@ -264,7 +268,7 @@
                 <button class="btn btn-blue  btn-sm" id="btn-confirm-user" onclick="confirmUserName()">Save</button>
             </div>
         </div>
-    </div>
+    </div> -->
 
     <div id="toast-container"></div>
     <script src="annotator.js"></script>

@@ -1,17 +1,11 @@
 /* =============================================================
-   tMark — Annotation Utility  |  tbits
-   File   : tmark.js
-
-   UPDATED VERSION:
-   - Fixed Black Boxes on imported PDF (annotationMode: 0)
-   - Fixed Imported Annotations re-appearing after delete
-   - Added Page State Caching (saves shapes across pages)
-   - Removed Summary Page from the standard PDF Download
-   - Added XSS Security (escapeHTML)
+   — Annotation Utility  |  tbits
+   File   : annotator.js
+   - Added Page State Caching & Hierarchy (IRT)
    ============================================================= */
 
 // ── CONSTANTS ──
-const PALETTE = ['#f04f5a','#f97316','#eab308','#18b87d','#0ea5e9','#3b6ef8','#8b5cf6','#ec4899','#1a2140','#8b96b8'];
+const PALETTE = ['#ffffff', '#f04f5a','#f97316','#eab308','#18b87d','#0ea5e9','#3b6ef8','#8b5cf6','#ec4899','#1a2140','#8b96b8'];
 const TYPE_LABELS = { rect:'Rectangle', circle:'Ellipse', draw:'Pencil', arrow:'Arrow', line:'Line', text:'Text' };
 
 // ── SECURITY HELPER ──
@@ -23,6 +17,10 @@ function escapeHTML(str) {
 }
 
 // ── STATE ──
+let currentUser      = 'Reviewer';
+let currentUserId    = 'user_local_001'; 
+let currentUserEmail = 'reviewer@tbits.com';
+
 let canvas;
 let fileType         = 'image';
 let fileName         = 'Document';
@@ -38,9 +36,7 @@ let pdfDoc           = null;
 let pageNum          = 1;
 let totalPages       = 1;
 let originalPdfBytes = null;
-let currentUser      = 'Reviewer';
 
-// New State Variables for Fixes
 let deletedImportedSignatures = new Set();
 let pageData = {};
 let isFileLoaded = false;
@@ -49,6 +45,7 @@ let isFileLoaded = false;
 // SECTION 1 — BOOTSTRAP
 // ═══════════════════════════════════════════════════════════════
 window.addEventListener('DOMContentLoaded', () => {
+    initializeUserIdentity();
     canvas = new fabric.Canvas('doc-canvas', { selection: true });
     canvas.setWidth(800);
     canvas.setHeight(600);
@@ -67,13 +64,19 @@ window.addEventListener('DOMContentLoaded', () => {
     setupDragDrop();
     setupButtons();
 
-    document.getElementById('user-name-input').addEventListener('keydown', e => {
-        if (e.key === 'Enter')  confirmUserName();
-        if (e.key === 'Escape') closeUserModal();
-    });
+    // Safely check if the element exists before adding event listener
+    const userNameInput = document.getElementById('user-name-input');
+    if (userNameInput) {
+        userNameInput.addEventListener('keydown', e => {
+            if (e.key === 'Enter')  confirmUserName();
+            if (e.key === 'Escape') closeUserModal();
+        });
+    }
 
     renderList();
 });
+
+
 
 // ═══════════════════════════════════════════════════════════════
 // SECTION 2 — FULL STATE RESET
@@ -116,33 +119,59 @@ function resetState() {
 
     const jp = document.getElementById('json-preview-panel');
     if (jp) jp.remove();
+    
     isFileLoaded = false;
 }
 
 // ═══════════════════════════════════════════════════════════════
 // SECTION 3 — USER IDENTITY
 // ═══════════════════════════════════════════════════════════════
-window.promptUserName = function () {
-    document.getElementById('user-name-input').value = currentUser;
-    document.getElementById('user-modal').style.display = 'flex';
-    setTimeout(() => {
-        const inp = document.getElementById('user-name-input');
-        inp.focus(); inp.select();
-    }, 80);
-};
-window.closeUserModal = function () {
-    document.getElementById('user-modal').style.display = 'none';
-};
-window.confirmUserName = function () {
-    const val = document.getElementById('user-name-input').value.trim();
-    if (!val) return;
-    currentUser = val;
-    document.getElementById('user-display-name').textContent    = val;
-    document.getElementById('user-avatar').textContent          = val.charAt(0).toUpperCase();
-    document.getElementById('user-modal').style.display         = 'none';
-    toast(`Reviewer set to "${val}"`, '👤');
-};
 
+//: Read from Token OR Header 
+function initializeUserIdentity() {
+    // ---------------------------------------------------------
+    // WAY 1: Try reading from JWT Token (Most Secure)
+    // ---------------------------------------------------------
+    const token = localStorage.getItem('app_token'); // 'app_token'  replace with our key name
+    
+    if (token) {
+        try {
+            // JWT Token has 3 parts (Header.Payload.Signature)
+            // we use  (Payload) to  decode 
+            const payload = JSON.parse(atob(token.split('.')[1])); 
+            
+            // Backend JSON keys set karein ( 'name', 'fullName', 'sub')
+            currentUser      = payload.name || payload.fullName || 'Reviewer';
+            currentUserId    = payload.sub || payload.userId || 'guest';
+            currentUserEmail = payload.email || '';
+            
+            console.log('✅ Identity loaded from JWT Token:', currentUser);
+            return; // Agar token mil gaya, toh function yahin rok do
+        } catch (error) {
+            console.warn('⚠️ Invalid JWT Token, falling back to Web Header...', error);
+        }
+    }
+
+    // ---------------------------------------------------------
+    // WAY 2: Fallback to Web Header (DOM Scraping)
+    // ---------------------------------------------------------
+    const headerUserNameElement = document.getElementById('header-user-name');
+    if (headerUserNameElement && headerUserNameElement.innerText) {
+        currentUser = headerUserNameElement.innerText.trim();
+        
+        // Agar ID navbar mein nahi hai, toh naam se hi ek dummy ID bana lo
+        const headerUserIdElement = document.getElementById('header-user-id');
+        currentUserId = headerUserIdElement ? headerUserIdElement.innerText.trim() : currentUser.toLowerCase().replace(/\s+/g, '_');
+        
+        console.log('✅ Identity loaded from Web Header:', currentUser);
+        return;
+    }
+
+    // ---------------------------------------------------------
+    // WAY 3: Final Fallback
+    // ---------------------------------------------------------
+    console.log('⚠️ No identity found. Defaulting to Guest/Reviewer.');
+}
 // ═══════════════════════════════════════════════════════════════
 // SECTION 4 — COLOR SWATCHES
 // ═══════════════════════════════════════════════════════════════
@@ -157,6 +186,7 @@ function buildAllSwatches() {
     });
 }
 function buildSwatches(container, onPick) {
+    if(!container) return;
     PALETTE.forEach(c => {
         const s = document.createElement('div');
         s.className = 'cswatch'; s.style.background = c;
@@ -232,32 +262,35 @@ async function recoverAnnotationsFromPdf(pageIndex) {
 
     try {
         const page  = await pdfDoc.getPage(pageIndex);
-        const vp    = page.getViewport({ scale: 1.5 });
+        const vp    = page.getViewport({ scale: 1.5 }); // for clear view
         const annots = await page.getAnnotations();
 
-        const textAnnots = annots.filter(a =>
-            a.subtype === 'Text' || a.annotationType === 1
-        );
-
+        const textAnnots = annots.filter(a => a.subtype === 'Text' || a.annotationType === 1);
         if (!textAnnots.length) return;
 
+        const parents = [];
+        const repliesRaw = [];
+        textAnnots.forEach(a => a.inReplyTo ? repliesRaw.push(a) : parents.push(a));
+
+        const idMapping = {}; 
         let recovered = 0;
 
-        for (const raw of textAnnots) {
-            const contents = raw.contentsObj?.str || raw.contents || '';
-            const author   = raw.titleObj?.str    || raw.title    || 'Unknown';
+        for (const raw of parents) {
+            let text = raw.contentsObj?.str || raw.contents || '';
+            const author = raw.titleObj?.str || raw.title || 'Unknown';
+            let type = raw.titleObj?.str ? (raw.subject || 'Comment') : 'Comment';
 
-            let annType = 'Comment';
-            let annText = contents;
-            let annNum  = annoCounter;
-            let parsedAuthor = author;
-
-            const headerMatch = contents.match(/^#(\d+)\s+\[([^\]]+)\](?:\s+by\s+(.+?))?\n?([\s\S]*)$/);
-            if (headerMatch) {
-                annNum        = parseInt(headerMatch[1]) || annoCounter;
-                annType       = headerMatch[2] || 'Comment';
-                parsedAuthor  = headerMatch[3] || author;
-                annText       = (headerMatch[4] || '').trim();
+            const typeMatch = text.match(/^#\d+\s+\[([^\]]+)\]/);
+            if (typeMatch) {
+                type = typeMatch[1]; 
+                const authorIndex = text.indexOf('by ' + author);
+                if (authorIndex !== -1) {
+                    const cutPos = authorIndex + ('by ' + author).length;
+                    text = text.substring(cutPos).trim();
+                } else {
+                    const firstNewLine = text.indexOf('\n');
+                    if (firstNewLine !== -1) text = text.substring(firstNewLine + 1).trim();
+                }
             }
 
             const rect = raw.rect; 
@@ -269,53 +302,69 @@ async function recoverAnnotationsFromPdf(pageIndex) {
             const cw = Math.max((rect[2] - rect[0]) * 1.5, 40);
             const ch = Math.max((rect[3] - rect[1]) * 1.5, 40);
 
-            // Skip if this specific imported annotation was previously deleted
             const sig = Math.round(cx) + '_' + Math.round(cy); 
-            if (deletedImportedSignatures.has(sig)) continue;  
+            if (deletedImportedSignatures?.has && deletedImportedSignatures.has(sig)) continue;  
 
             const pdfColor = raw.color;
             let hexColor = '#3b6ef8';
             if (pdfColor && pdfColor.length === 3) {
-                hexColor = '#' + pdfColor.map(v =>
-                    Math.round(v * 255).toString(16).padStart(2, '0')
-                ).join('');
+                hexColor = '#' + pdfColor.map(v => Math.round(v * 255).toString(16).padStart(2, '0')).join('');
+            }
+
+            let fabricFill = 'transparent';
+            if (hexColor !== '#ffffff') {
+                const r = parseInt(hexColor.slice(1, 3), 16);
+                const g = parseInt(hexColor.slice(3, 5), 16);
+                const b = parseInt(hexColor.slice(5, 7), 16);
+                if (!isNaN(r) && !isNaN(g) && !isNaN(b)) {
+                    fabricFill = `rgba(${r}, ${g}, ${b}, 0.1)`;
+                }
             }
 
             const marker = new fabric.Rect({
-                left:            cx,
-                top:             cy,
-                width:           cw,
-                height:          ch,
-                stroke:          hexColor,
-                strokeWidth:     2,
-                strokeDashArray: [6, 3],
-                fill:            hexColor + '18',
-                transparentCorners: false,
-                cornerColor:     '#3b6ef8',
-                cornerSize:      8,
-                borderColor:     '#3b6ef8',
+                left: cx, top: cy, width: cw, height: ch,
+                stroke: hexColor, strokeWidth: 2, strokeDashArray: [6, 3],
+                fill: fabricFill, transparentCorners: false,
+                cornerColor: '#3b6ef8', cornerSize: 8, borderColor: '#3b6ef8',
             });
 
             const id = 'imported-' + Date.now() + '-' + recovered;
             marker.id = id;
             canvas.add(marker);
+            idMapping[raw.id] = id; 
+            const now = new Date().toISOString();
 
             annotations.push({
-                id,
-                number:      annoCounter++,
-                author:      parsedAuthor,
-                type:        annType,
-                date:        new Date().toLocaleString(),
-                text:        annText || '(no comment)',
-                isDraft:     false,
-                color:       hexColor,
-                fabricType:  'rect',
-                isImported:  true,
-                originalNum: annNum,
-                signature:   sig 
+                id, number: annoCounter++, 
+                type: type, 
+                text: text, isDraft: false, color: hexColor, fabricType: 'rect',
+                isImported: true, signature: sig, 
+                
+                // Tier 2 Mapping
+                createdBy: { id: 'imported', name: author, email: '' },
+                createdAt: now,
+                date: new Date().toLocaleString(),
+                lastEditedBy: null, lastEditedAt: null, editHistory: [], replies: []
             });
-
             recovered++;
+        }
+
+        for (const rep of repliesRaw) {
+            const parentCustomId = idMapping[rep.inReplyTo];
+            if (!parentCustomId) continue; 
+            
+            const parentObj = annotations.find(a => a.id === parentCustomId);
+            if (parentObj) {
+                const repAuthor = rep.titleObj?.str || rep.title || 'Reviewer';
+                parentObj.replies.push({
+                    id: 'rep-imp-' + Date.now() + Math.random(),
+                    createdBy: { id: 'imported', name: repAuthor, email: '' },
+                    createdAt: new Date().toISOString(),
+                    date: new Date().toLocaleString(),
+                    text: rep.contentsObj?.str || rep.contents || '',
+                    isImported: true
+                });
+            }
         }
 
         canvas.renderAll();
@@ -323,10 +372,7 @@ async function recoverAnnotationsFromPdf(pageIndex) {
         renderBadges();
         updateJsonState();
 
-        if (recovered > 0) {
-            showImportBanner(recovered);
-            toast(`Recovered ${recovered} annotation${recovered > 1 ? 's' : ''} from PDF`, '📥', 4000);
-        }
+        if (recovered > 0) showImportBanner(recovered);
 
     } catch (err) {
         console.warn('Annotation recovery skipped:', err.message);
@@ -359,8 +405,11 @@ async function renderPdfPage(n) {
     const tmp  = document.createElement('canvas');
     tmp.width  = vp.width; tmp.height = vp.height;
     
-    // Added annotationMode: 0 to prevent black boxes
-    await page.render({ canvasContext: tmp.getContext('2d'), viewport: vp, annotationMode: 0 }).promise;
+    await page.render({ 
+        canvasContext: tmp.getContext('2d'), 
+        viewport: vp, 
+        annotationMode: 0 
+    }).promise;
     
     await loadFabric(tmp.toDataURL('image/png'));
     updatePageNav();
@@ -377,7 +426,6 @@ async function changePage(dir) {
     const np = pageNum + dir;
     if (np < 1 || np > totalPages) return;
 
-    // Save current page state
     pageData[pageNum] = {
         annotations: [...annotations],
         annoCounter: annoCounter,
@@ -392,7 +440,6 @@ async function changePage(dir) {
 
     await renderPdfPage(pageNum);
 
-    // Restore page state if it exists
     if (pageData[pageNum]) {
         annotations = pageData[pageNum].annotations;
         annoCounter = pageData[pageNum].annoCounter;
@@ -555,12 +602,21 @@ function finalizeAnno(obj, type) {
     activateTool('select');
     const id = 'anno-' + Date.now();
     obj.id = id;
+    const now = new Date().toISOString();
+    
     annotations.push({
-        id, number: annoCounter++, author: currentUser,
+        id, number: annoCounter++, 
         type: TYPE_LABELS[type] || type,
         date: new Date().toLocaleString(),
         text: '', isDraft: true, color: currentColor, fabricType: type,
         isImported: false,
+        // Enterprise Identity Fields
+        createdBy: { id: currentUserId, name: currentUser, email: currentUserEmail },
+        createdAt: now,
+        lastEditedBy: null,
+        lastEditedAt: null,
+        editHistory: [],
+        replies: [] 
     });
     canvas.setActiveObject(obj);
     showCommentInput(id, true);
@@ -717,10 +773,10 @@ function hideCtx() { document.getElementById('context-menu').style.display = 'no
 window.deleteActiveObject = function () {
     const obj = canvas.getActiveObject(); if (!obj) return;
     
-    // Add to deleted set if it's an imported annotation
-    const anno = annotations.find(a => a.id === obj.id);
-    if (anno && anno.isImported && anno.signature) {
-        deletedImportedSignatures.add(anno.signature);
+    if (obj.id && obj.id.startsWith('imported-')) {
+        const sigId = obj.id;
+        const matched = annotations.find(a => a.id === sigId);
+        if (matched && matched.signature) deletedImportedSignatures.add(matched.signature);
     }
 
     canvas.remove(obj);
@@ -735,7 +791,18 @@ window.duplicateObject = function () {
     obj.clone(clone => {
         clone.set({ left: obj.left + 20, top: obj.top + 20, id: 'anno-' + Date.now() });
         const orig = annotations.find(a => a.id === obj.id);
-        if (orig) annotations.push({ ...orig, id: clone.id, number: annoCounter++, isDraft: false, isImported: false });
+        if (orig) {
+            annotations.push({ 
+                ...orig, 
+                id: clone.id, 
+                number: annoCounter++, 
+                isDraft: false, 
+                isImported: false, 
+                createdBy: { id: currentUserId, name: currentUser, email: currentUserEmail },
+                createdAt: new Date().toISOString(),
+                replies: [] 
+            });
+        }
         canvas.add(clone); canvas.setActiveObject(clone); canvas.renderAll();
         renderList(); renderBadges(); updateJsonState();
     });
@@ -803,8 +870,27 @@ function cancelInput() {
 function postComment() {
     const val = document.getElementById('comment-textarea').value.trim();
     if (!val) return;
+    
     const anno = annotations.find(a => a.id === activeAnnoId);
-    if (anno) { anno.text = val; anno.isDraft = false; anno.date = new Date().toLocaleString(); }
+    if (anno) { 
+        const now = new Date().toISOString();
+        
+        // History Tracking
+        if (!anno.isDraft && anno.text !== val && anno.text !== '') {
+            anno.editHistory.push({
+                by: anno.lastEditedBy ? anno.lastEditedBy.name : (anno.createdBy ? anno.createdBy.name : 'Unknown'),
+                at: anno.lastEditedAt || anno.createdAt || now,
+                text: anno.text
+            });
+            anno.lastEditedBy = { id: currentUserId, name: currentUser };
+            anno.lastEditedAt = now;
+        }
+        
+        anno.text = val; 
+        anno.isDraft = false; 
+        anno.date = new Date().toLocaleString(); 
+    }
+    
     hideCommentInput(); canvas.discardActiveObject(); canvas.renderAll();
     renderBadges(); updateJsonState();
     toast('Comment saved', '💬');
@@ -817,7 +903,6 @@ window.editComment = id => {
 };
 
 window.deleteComment = id => {
-    // Add to deleted set if it's an imported annotation
     const anno = annotations.find(a => a.id === id);
     if (anno && anno.isImported && anno.signature) {
         deletedImportedSignatures.add(anno.signature);
@@ -828,6 +913,36 @@ window.deleteComment = id => {
     annotations = annotations.filter(a => a.id !== id);
     canvas.renderAll(); renderList(); renderBadges(); updateJsonState();
     toast('Deleted', '🗑');
+};
+
+window.addReply = function(parentId) {
+    const input = document.getElementById(`reply-input-${parentId}`);
+    if (!input) return;
+    
+    const text = input.value.trim();
+    if (!text) return;
+    
+    const parent = annotations.find(a => a.id === parentId);
+    if (parent) {
+        if (!parent.replies) parent.replies = [];
+        parent.replies.push({
+            id: 'rep-' + Date.now(),
+            createdBy: {
+                id: currentUserId,
+                name: currentUser,
+                email: currentUserEmail
+            },
+            createdAt: new Date().toISOString(),
+            date: new Date().toLocaleString(),
+            text: text,
+            isImported: false
+        });
+        
+        input.value = ''; 
+        renderList();
+        updateJsonState();
+        toast('Reply added', '💬');
+    }
 };
 
 function renderList() {
@@ -852,20 +967,46 @@ function renderList() {
             ? `<span class="cc-origin-tag imported">📥 Imported</span>`
             : `<span class="cc-origin-tag new">✏ New</span>`;
 
+        let repliesHTML = '';
+        if (a.replies && a.replies.length > 0) {
+            repliesHTML = `<div class="cc-replies">` + 
+                a.replies.map(rep => {
+                    const repAuthor = rep.createdBy ? rep.createdBy.name : (rep.author || 'Reviewer');
+                    return `
+                    <div class="cc-reply-item">
+                        <div class="cc-reply-header">
+                            <span class="cc-reply-author">${escapeHTML(repAuthor)}</span>
+                            <span class="cc-reply-date">${(rep.date || rep.createdAt || '').split(',')[0]}</span>
+                        </div>
+                        <div class="cc-reply-text">${escapeHTML(rep.text)}</div>
+                    </div>
+                `}).join('') + `</div>`;
+        }
+
+        const replyInputHTML = `
+            <div class="cc-reply-input-wrap" onclick="event.stopPropagation()">
+                <input type="text" id="reply-input-${a.id}" class="cc-reply-input" placeholder="Write a reply...">
+                <button class="cc-reply-btn" onclick="addReply('${a.id}')">Reply</button>
+            </div>
+        `;
+
+        const mainAuthor = a.createdBy ? a.createdBy.name : (a.author || 'Reviewer');
         card.innerHTML = `
             <div class="cc-top">
                 <div class="cc-badge" style="background:${a.color}">${a.number}</div>
                 <span class="cc-type-tag">${a.type}</span>
                 ${originTag}
-                <span class="cc-date">${a.date.split(',')[0]}</span>
+                <span class="cc-date">${(a.date || a.createdAt || '').split(',')[0]}</span>
             </div>
-            <div class="cc-author"><span class="cc-author-icon">👤</span>${escapeHTML(a.author || 'Reviewer')}</div>
+            <div class="cc-author"><span class="cc-author-icon">👤</span>${escapeHTML(mainAuthor)}</div>
             <div class="cc-body">${escapeHTML(a.text)}</div>
+            ${repliesHTML}
+            ${replyInputHTML}
             <div class="cc-actions">
                 <button class="cc-btn"     data-action="edit"   data-id="${a.id}" title="Edit">✏</button>
                 <button class="cc-btn del" data-action="delete" data-id="${a.id}" title="Delete">🗑</button>
             </div>`;
-
+        
         card.addEventListener('click', e => {
             const btn = e.target.closest('.cc-btn');
             if (btn) {
@@ -884,11 +1025,7 @@ function renderList() {
 // ═══════════════════════════════════════════════════════════════
 // SECTION 15 — JSON STATE
 // ═══════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════
-// SECTION 15 — JSON STATE
-// ═══════════════════════════════════════════════════════════════
 function getAnnotationsJSON() {
-    // Current page ka data pehle sync karein
     pageData[pageNum] = {
         annotations: [...annotations],
         annoCounter: annoCounter,
@@ -903,13 +1040,20 @@ function getAnnotationsJSON() {
             allPub.push({
                 id:         a.id,
                 number:     a.number,
-                author:     a.author,
                 type:       a.type,
                 color:      a.color,
-                date:       a.date,
-                text:       a.text,
                 page:       parseInt(pStr),
                 isImported: a.isImported || false,
+                
+                // Enterprise Identity Output
+                createdBy:    a.createdBy || { name: a.author || 'Unknown' },
+                createdAt:    a.createdAt || new Date().toISOString(),
+                lastEditedBy: a.lastEditedBy || null,
+                lastEditedAt: a.lastEditedAt || null,
+                editHistory:  a.editHistory || [],
+                text:         a.text,
+                replies:      a.replies || [],
+                
                 bbox: objData ? {
                     x:      Math.round(objData.left),
                     y:      Math.round(objData.top),
@@ -923,7 +1067,7 @@ function getAnnotationsJSON() {
     return {
         documentName: fileName,
         exportedAt:   new Date().toISOString(),
-        reviewer:     currentUser,
+        reviewer:     { id: currentUserId, name: currentUser },
         totalPages,
         currentPage:  pageNum,
         annotations:  allPub
@@ -931,7 +1075,6 @@ function getAnnotationsJSON() {
 }
 
 function updateJsonState() {
-    // Current page aur baaki saare pages ka total count dikhayein
     let totalAnnots = 0;
     const currentPub = annotations.filter(a => !a.isDraft);
     totalAnnots += currentPub.length;
@@ -941,8 +1084,8 @@ function updateJsonState() {
             totalAnnots += data.annotations.filter(a => !a.isDraft).length;
         }
     }
-    document.getElementById('st-json-count').textContent =
-        `{ } ${totalAnnots} annotation${totalAnnots !== 1 ? 's' : ''}`;
+    const jsCount = document.getElementById('st-json-count');
+    if (jsCount) jsCount.textContent = `{ } ${totalAnnots} annotation${totalAnnots !== 1 ? 's' : ''}`;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1013,13 +1156,8 @@ function showProgress(v, title = 'Processing…', sub = 'Please wait') {
 function setProgress(pct) { document.getElementById('progress-fill').style.width = pct + '%'; }
 
 // ═══════════════════════════════════════════════════════════════
-// SECTION 19 — BUTTON WIRING (Updated for Multi-Page & Summary)
+// SECTION 19 — BUTTON WIRING & FALLBACK PREVIEW
 // ═══════════════════════════════════════════════════════════════
-// function setupButtons() {
-//     document.getElementById('btn-download').addEventListener('click', handleDownload);
-//     document.getElementById('btn-save-server').addEventListener('click', handleSaveToServer);
-//     document.getElementById('btn-export-summary').addEventListener('click', handleSummary);
-// }
 function checkFileLoaded() {
     if (!isFileLoaded) {
         toast('Please open a document first!', '⚠️');
@@ -1027,11 +1165,9 @@ function checkFileLoaded() {
     }
     return true;
 }
+
 function setupButtons() {
-    // document.getElementById('btn-download').addEventListener('click', handleDownload);
-    // document.getElementById('btn-save-server').addEventListener('click', handleSaveToServer);
-    // document.getElementById('btn-export-summary').addEventListener('click', handleSummary);
-   document.getElementById('btn-download').addEventListener('click', () => {
+    document.getElementById('btn-download').addEventListener('click', () => {
         if (checkFileLoaded()) handleDownload();
     });
     
@@ -1043,34 +1179,57 @@ function setupButtons() {
         if (checkFileLoaded()) handleSummary();
     });
 
-    
-    // 👇 NAYA CODE: View JSON Button ke liye 👇
-    document.getElementById('btn-view-json').addEventListener('click', () => {
-        syncCurrentPage(); // Current drawing ko save karega
-        const jsonData = getAnnotationsJSON();
-        showJsonPreview(jsonData); // Screen par popup mein dikhayega
-    });
+    const viewJsonBtn = document.getElementById('btn-view-json');
+    if (viewJsonBtn) {
+        viewJsonBtn.addEventListener('click', () => {
+            if (!checkFileLoaded()) return;
+            syncCurrentPage(); 
+            const jsonData = getAnnotationsJSON();
+            showJsonPreview(jsonData); 
+        });
+    }
 
-    // 👇 NAYA CODE: Download JSON Button ke liye 👇
-    document.getElementById('btn-download-json').addEventListener('click', () => {
-        syncCurrentPage();
-        const jsonData = getAnnotationsJSON();
+    const dwnJsonBtn = document.getElementById('btn-download-json');
+    if (dwnJsonBtn) {
+        dwnJsonBtn.addEventListener('click', () => {
+            if (!checkFileLoaded()) return;
+            syncCurrentPage();
+            const jsonData = getAnnotationsJSON();
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(jsonData, null, 2));
+            const downloadAnchorNode = document.createElement('a');
+            downloadAnchorNode.setAttribute("href",     dataStr);
+            downloadAnchorNode.setAttribute("download", fileName + "_annotations.json");
+            document.body.appendChild(downloadAnchorNode); 
+            downloadAnchorNode.click();
+            downloadAnchorNode.remove();
+            toast('JSON file downloaded!', '📄');
+        });
+    }
+}
+
+function showJsonPreview(payload) {
+    const existing = document.getElementById('json-preview-panel');
+    if (existing) existing.remove();
+    
+    const panel = document.createElement('div');
+    panel.id = 'json-preview-panel';
+    panel.style.cssText = `position:fixed;bottom:50px;right:16px;width:420px;max-height:320px;
+        background:#1a2140;color:#c7d4fd;border-radius:12px;padding:16px;
+        font-family:monospace;font-size:11px;line-height:1.6;
+        overflow:auto;z-index:9999;box-shadow:0 12px 40px rgba(0,0,0,0.4);border:1.5px solid #3b6ef8;`;
         
-        // JSON ko ek text file banakar download karwayega
-        const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(jsonData, null, 2));
-        const downloadAnchorNode = document.createElement('a');
-        downloadAnchorNode.setAttribute("href",     dataStr);
-        downloadAnchorNode.setAttribute("download", fileName + "_annotations.json");
-        document.body.appendChild(downloadAnchorNode); // Firefox support ke liye
-        downloadAnchorNode.click();
-        downloadAnchorNode.remove();
+    panel.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <span style="font-weight:700;color:#fff;font-size:12px">📋 Annotations JSON</span>
+            <button onclick="document.getElementById('json-preview-panel').remove()"
+                style="background:#3b6ef8;border:none;color:#fff;border-radius:6px;padding:3px 9px;cursor:pointer;font-size:11px">✕ Close</button>
+        </div>
+        <pre style="margin:0;white-space:pre-wrap;word-break:break-all">${JSON.stringify(payload, null, 2)}</pre>`;
         
-        toast('JSON file downloaded!', '📄');
-    });
+    document.body.appendChild(panel);
 }
 
 function syncCurrentPage() {
-    // Current page ko globally save karna zaroori hai export se pehle
     pageData[pageNum] = {
         annotations: [...annotations],
         annoCounter: annoCounter,
@@ -1114,12 +1273,12 @@ async function handleSaveToServer() {
         const blob     = new Blob([pdfBytes], { type: 'application/pdf' });
         const formData = new FormData();
         formData.append('file',        blob,                        `${fileName}_Annotated.pdf`);
-        formData.append('annotations', JSON.stringify(jsonPayload), 'annotations.json');
+        formData.append('annotations', JSON.stringify(jsonPayload));
         formData.append('fileName',    fileName);
         formData.append('reviewer',    currentUser);
         setProgress(90);
-
-        const SERVER_URL = '/api/annotations/save';
+       
+        const SERVER_URL = 'http://192.168.1.4:8080/api/annotations/save';
         try {
             const response = await fetch(SERVER_URL, { method: 'POST', body: formData });
             setProgress(100);
@@ -1140,7 +1299,6 @@ async function handleSaveToServer() {
 async function handleSummary() {
     syncCurrentPage();
     
-    // Saare pages se annotations collect karein
     let allPub = [];
     for (const [pStr, data] of Object.entries(pageData)) {
         const pagePub = data.annotations.filter(a => !a.isDraft).map(a => ({...a, page: parseInt(pStr)}));
@@ -1155,7 +1313,7 @@ async function handleSummary() {
         const fontR = await doc.embedFont(StandardFonts.Helvetica);
         const fontB = await doc.embedFont(StandardFonts.HelveticaBold);
         
-        await drawSummaryPage(doc, allPub, fontR, fontB); // Pass ALL pages data
+        await drawSummaryPage(doc, allPub, fontR, fontB); 
         
         const bytes = await doc.save();
         const blob  = new Blob([bytes], { type: 'application/pdf' });
@@ -1171,7 +1329,7 @@ async function handleSummary() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SECTION 20 — PDF EXPORT HELPERS (Fixed for Unicode & Loop)
+// SECTION 20 — PDF EXPORT HELPERS 
 // ═══════════════════════════════════════════════════════════════
 function getPDFLib() {
     const lib = window.PDFLib;
@@ -1188,28 +1346,14 @@ function dataURLtoBytes(dataURL) {
 
 function hexToRgb01(hex) {
     let h = (hex || '#3b6ef8').replace('#', '');
-    
-    // Agar hex code 3 character ka hai (e.g. 'fff'), toh usko 6 character banayein ('ffffff')
-    if (h.length === 3) {
-        h = h.split('').map(c => c + c).join('');
-    }
-    
-    // Fallback: Agar kisi wajah se invalid color hai toh default blue color use karein
+    if (h.length === 3) h = h.split('').map(c => c + c).join('');
     if (h.length !== 6) h = '3b6ef8';
-
     const r = parseInt(h.substring(0, 2), 16) / 255;
     const g = parseInt(h.substring(2, 4), 16) / 255;
     const b = parseInt(h.substring(4, 6), 16) / 255;
-
-    // Safety check taaki NaN pass na ho
-    return [
-        isNaN(r) ? 0 : r, 
-        isNaN(g) ? 0 : g, 
-        isNaN(b) ? 1 : b
-    ];
+    return [ isNaN(r) ? 0 : r, isNaN(g) ? 0 : g, isNaN(b) ? 1 : b ];
 }
 
-// Safe Unicode encoding for PDF Sticky Notes (Supports Arabic/Hindi)
 function toUTF16BEHex(str) {
     let hex = 'FEFF'; 
     for (let i = 0; i < str.length; i++) {
@@ -1220,7 +1364,6 @@ function toUTF16BEHex(str) {
 
 async function buildAnnotatedPdf(onProgress = () => {}) {
     const lib = getPDFLib();
-    // 👇 ADDED: rgb and StandardFonts to draw native numbers
     const { PDFDocument, PDFName, PDFHexString, PDFString, rgb, StandardFonts } = lib;
 
     onProgress(5);
@@ -1236,7 +1379,6 @@ async function buildAnnotatedPdf(onProgress = () => {}) {
         pg.drawImage(pngImage, { x:0, y:0, width:pngImage.width, height:pngImage.height });
     }
     
-    // 👇 NAYA CODE: Font load kar rahe hain numbers draw karne ke liye
     const fontB = await pdfDoc2.embedFont(StandardFonts.HelveticaBold);
     onProgress(20);
 
@@ -1250,6 +1392,38 @@ async function buildAnnotatedPdf(onProgress = () => {}) {
 
         const pdfPage = pages[pIndex];
         const { width: pW, height: pH } = pdfPage.getSize();
+
+        // Safe Cleanup (Deletes Text AND Popup so Adobe doesn't resurrect them)
+        let annotsRef =  pdfPage.node.set(PDFName.of('Annots'), pdfDoc2.context.obj([]));
+       
+        let annotsArr;
+
+        if (annotsRef) {
+            let annotsObj = pdfDoc2.context.lookup(annotsRef); 
+            if (annotsObj && typeof annotsObj.size === 'function') {
+                const cleanArr = [];
+                for (let i = 0; i < annotsObj.size(); i++) {
+                    const ref = annotsObj.get(i);
+                    const annot = pdfDoc2.context.lookup(ref);
+                    if (annot) {
+                        const stRef = annot.get(PDFName.of('Subtype'));
+                        const stObj = pdfDoc2.context.lookup(stRef);
+                        const subtypeName = stObj ? stObj.name : '';
+                        if (subtypeName === 'Text' || subtypeName === 'Popup') {
+                            continue; 
+                        }
+                    }
+                    cleanArr.push(ref);
+                }
+                annotsArr = pdfDoc2.context.obj(cleanArr);
+            } else {
+                annotsArr = pdfDoc2.context.obj([]);
+            }
+            pdfPage.node.set(PDFName.of('Annots'), annotsArr);
+        } else {
+            annotsArr = pdfDoc2.context.obj([]);
+            pdfPage.node.set(PDFName.of('Annots'), annotsArr);
+        }
         
         const baseW = pW * 1.5; 
         const baseH = pH * 1.5;
@@ -1264,6 +1438,7 @@ async function buildAnnotatedPdf(onProgress = () => {}) {
 
             await new Promise(resolve => {
                 tmpFabric.loadFromJSON(data.canvasData, () => {
+                    tmpFabric.backgroundColor = null; 
                     tmpFabric.backgroundImage = null; 
                     const objects = tmpFabric.getObjects();
                     objects.forEach(obj => {
@@ -1286,50 +1461,30 @@ async function buildAnnotatedPdf(onProgress = () => {}) {
             const objData = data.canvasData.objects.find(o => o.id === anno.id);
             if (!objData) continue;
 
-            const objW = (objData.width || 40) * (objData.scaleX || 1);
-            const objH = (objData.height || 40) * (objData.scaleY || 1);
-
             const x = objData.left * scaleX;
-            const y = pH - (objData.top + objH) * scaleY; 
-            const topY = pH - objData.top * scaleY; // Shape ke bilkul top ka coordinate
-            const w = Math.max(objW * scaleX, 40);
-            const h = Math.max(objH * scaleY, 40);
+            const topY = pH - objData.top * scaleY; 
             const [cr, cg, cb] = hexToRgb01(anno.color);
             
-            // 👇 NAYA CODE: PDF ke upar permanently badge (Number) draw karna 👇
             const badgeX = x;
-            const badgeY = topY + 5; // Thoda sa upar adjust kiya taaki shape clear dikhe
-            
-            // Background circle draw karein
-            pdfPage.drawCircle({
-                x: badgeX,
-                y: badgeY,
-                size: 9,
-                color: rgb(cr, cg, cb)
-            });
-            
-            // Us circle ke andar white color mein Number draw karein
+            const badgeY = topY + 5;
+            pdfPage.drawCircle({ x: badgeX, y: badgeY, size: 9, color: rgb(cr, cg, cb) });
             const numStr = String(anno.number);
             const textWidth = fontB.widthOfTextAtSize(numStr, 10);
-            pdfPage.drawText(numStr, {
-                x: badgeX - (textWidth / 2),
-                y: badgeY - 3.5,
-                size: 10,
-                font: fontB,
-                color: rgb(1, 1, 1), // White text
-            });
-            // 👆 ----------------------------------------------------------- 👆
+            pdfPage.drawText(numStr, { x: badgeX - (textWidth / 2), y: badgeY - 3.5, size: 10, font: fontB, color: rgb(1, 1, 1) });
 
             const dateStr = new Date().toISOString().replace(/[-:.TZ]/g,'').substring(0,14);
+            const tinyRect = pdfDoc2.context.obj([badgeX - 10, badgeY - 15, badgeX + 10, badgeY + 5]);
+
+            const annoAuthorName = anno.createdBy ? anno.createdBy.name : (anno.author || 'Reviewer');
+
             const annotRef  = pdfDoc2.context.nextRef();
-            const textContent = `#${anno.number} [${anno.type}] by ${anno.author}\n${anno.text}`;
-            
             const annotDict = pdfDoc2.context.obj({
                 Type:     PDFName.of('Annot'),
                 Subtype:  PDFName.of('Text'),
-                Rect:     pdfDoc2.context.obj([x, y, x+w, y+h]),
-                Contents: PDFHexString.of(toUTF16BEHex(textContent)),
-                T:        PDFHexString.of(toUTF16BEHex(anno.author || 'Reviewer')),
+                Rect:     tinyRect, 
+                Contents: PDFHexString.of(toUTF16BEHex(anno.text)),
+                T:        PDFHexString.of(toUTF16BEHex(annoAuthorName)),
+                Subj:     PDFHexString.of(toUTF16BEHex(anno.type)),
                 M:        PDFString.of(`D:${dateStr}`),
                 C:        pdfDoc2.context.obj([cr, cg, cb]),
                 F:        pdfDoc2.context.obj(4),
@@ -1337,13 +1492,26 @@ async function buildAnnotatedPdf(onProgress = () => {}) {
                 Open:     pdfDoc2.context.obj(false),
             });
             pdfDoc2.context.assign(annotRef, annotDict);
-
-            let annotsArr = pdfPage.node.get(PDFName.of('Annots'));
-            if (!annotsArr) {
-                annotsArr = pdfDoc2.context.obj([]);
-                pdfPage.node.set(PDFName.of('Annots'), annotsArr);
-            }
             annotsArr.push(annotRef);
+
+            if (anno.replies && anno.replies.length > 0) {
+                for (const rep of anno.replies) {
+                    const repAuthorName = rep.createdBy ? rep.createdBy.name : (rep.author || 'Reviewer');
+                    const repRef = pdfDoc2.context.nextRef();
+                    const repDict = pdfDoc2.context.obj({
+                        Type:     PDFName.of('Annot'),
+                        Subtype:  PDFName.of('Text'),
+                        Rect:     tinyRect, 
+                        Contents: PDFHexString.of(toUTF16BEHex(rep.text)),
+                        T:        PDFHexString.of(toUTF16BEHex(repAuthorName)),
+                        IRT:      annotRef, 
+                        RT:       PDFName.of('R'),
+                        M:        PDFString.of(`D:${dateStr}`),
+                    });
+                    pdfDoc2.context.assign(repRef, repDict);
+                    annotsArr.push(repRef);
+                }
+            }
         }
         processed++;
         onProgress(20 + (processed / totalPagesWithData) * 70);
@@ -1352,59 +1520,7 @@ async function buildAnnotatedPdf(onProgress = () => {}) {
     onProgress(95);
     return pdfDoc2.save();
 }
-// async function drawSummaryPage(pdfDoc2, pub, fontR, fontB) {
-//     const { rgb } = getPDFLib();
-//     const gray1  = rgb(0.10, 0.13, 0.25);
-//     const gray2  = rgb(0.31, 0.36, 0.50);
-//     const blue   = rgb(0.23, 0.43, 0.97);
-//     const bgBlue = rgb(0.94, 0.96, 1.00);
-//     const purple = rgb(0.55, 0.36, 0.96);
 
-//     // Font crash rokne ke liye text sanitize karna (removes Arabic characters specific to Helvetica only for summary rendering)
-//     function sanitize(str) { return (str || '').replace(/[^\x00-\xFF]/g, '?'); }
-
-//     let page = pdfDoc2.addPage([595, 842]);
-//     let sy = 778;
-
-//     const drawHeader = () => {
-//         page.drawRectangle({ x:0, y:802, width:595, height:40, color:bgBlue });
-//         page.drawText('Annotation Summary', { x:28, y:822, size:15, font:fontB, color:gray1 });
-//         page.drawText(`${sanitize(fileName)}  ·  ${new Date().toLocaleDateString()}  ·  ${pub.length} annotation(s)`, { x:28, y:808, size:7.5, font:fontR, color:gray2 });
-//         page.drawLine({ start:{x:0,y:802}, end:{x:595,y:802}, thickness:1.5, color:blue });
-//         sy = 778;
-//     };
-
-//     drawHeader();
-
-//     for (const a of pub) {
-//         if (sy < 80) { page = pdfDoc2.addPage([595, 842]); drawHeader(); } // Auto-Pagination Handle
-        
-//         page.drawText(`Page ${a.page || 1}  |  #${a.number}  ${sanitize(a.type)}`, { x:28, y:sy, size:10, font:fontB, color:gray1 });
-//         page.drawText(`by ${sanitize(a.author || 'Reviewer')}`, { x:230, y:sy, size:9, font:fontR, color:blue });
-//         if (a.isImported) page.drawText('(imported)', { x:340, y:sy, size:8, font:fontR, color:purple });
-//         page.drawText(sanitize(a.date), { x:430, y:sy, size:8, font:fontR, color:gray2 });
-//         sy -= 5;
-//         page.drawLine({ start:{x:28,y:sy}, end:{x:567,y:sy}, thickness:0.4, color:rgb(0.85,0.88,0.95) });
-//         sy -= 14;
-        
-//         const words = sanitize(a.text).split(' ');
-//         let line = '';
-//         for (const w of words) {
-//             const test = line ? line + ' ' + w : w;
-//             if (fontR.widthOfTextAtSize(test, 10) > 520) {
-//                 if (sy < 60) { page = pdfDoc2.addPage([595, 842]); drawHeader(); }
-//                 page.drawText(line, { x:28, y:sy, size:10, font:fontR, color:gray2 });
-//                 sy -= 14; line = w;
-//             } else { line = test; }
-//         }
-//         if (line) { 
-//             if (sy < 60) { page = pdfDoc2.addPage([595, 842]); drawHeader(); }
-//             page.drawText(line, { x:28, y:sy, size:10, font:fontR, color:gray2 }); 
-//             sy -= 14; 
-//         }
-//         sy -= 10;
-//     }
-// }
 async function drawSummaryPage(pdfDoc2, pub, fontR, fontB) {
     const { rgb } = getPDFLib();
     const gray1  = rgb(0.10, 0.13, 0.25);
@@ -1413,11 +1529,8 @@ async function drawSummaryPage(pdfDoc2, pub, fontR, fontB) {
     const bgBlue = rgb(0.94, 0.96, 1.00);
     const purple = rgb(0.55, 0.36, 0.96);
 
-    // FIX: Removed newlines (\n, \r) by replacing them with a space, preventing the WinAnsi crash
     function sanitize(str) { 
-        return (str || '')
-            .replace(/[^\x00-\xFF]/g, '?') 
-            .replace(/[\r\n]+/g, ' '); 
+        return (str || '').replace(/[^\x00-\xFF]/g, '?').replace(/[\r\n]+/g, ' '); 
     }
 
     let page = pdfDoc2.addPage([595, 842]);
@@ -1436,15 +1549,16 @@ async function drawSummaryPage(pdfDoc2, pub, fontR, fontB) {
     for (const a of pub) {
         if (sy < 80) { page = pdfDoc2.addPage([595, 842]); drawHeader(); } 
         
+        const mainAuthor = a.createdBy ? a.createdBy.name : (a.author || 'Reviewer');
+        
         page.drawText(`Page ${a.page || 1}  |  #${a.number}  ${sanitize(a.type)}`, { x:28, y:sy, size:10, font:fontB, color:gray1 });
-        page.drawText(`by ${sanitize(a.author || 'Reviewer')}`, { x:230, y:sy, size:9, font:fontR, color:blue });
+        page.drawText(`by ${sanitize(mainAuthor)}`, { x:230, y:sy, size:9, font:fontR, color:blue });
         if (a.isImported) page.drawText('(imported)', { x:340, y:sy, size:8, font:fontR, color:purple });
-        page.drawText(sanitize(a.date), { x:430, y:sy, size:8, font:fontR, color:gray2 });
+        page.drawText(sanitize(a.date || a.createdAt), { x:430, y:sy, size:8, font:fontR, color:gray2 });
         sy -= 5;
         page.drawLine({ start:{x:28,y:sy}, end:{x:567,y:sy}, thickness:0.4, color:rgb(0.85,0.88,0.95) });
         sy -= 14;
         
-        // Use regex split to ensure no hidden whitespace characters break the loop
         const words = sanitize(a.text).split(/\s+/);
         let line = '';
         for (const w of words) {
@@ -1462,4 +1576,5 @@ async function drawSummaryPage(pdfDoc2, pub, fontR, fontB) {
             sy -= 14; 
         }
         sy -= 10;
-    }}
+    }
+}

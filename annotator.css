@@ -536,3 +536,39 @@ body {
 .anno-badge.imported-badge {
     border: 2px dashed rgba(255,255,255,0.6);
 }
+
+/* ── REPLIES HIERARCHY ── */
+.cc-replies {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.cc-reply-item {
+    padding-left: 12px;
+    border-left: 2px solid var(--blue-mid);
+}
+.cc-reply-header {
+    display: flex; justify-content: space-between;
+    font-size: 10.5px; margin-bottom: 3px;
+}
+.cc-reply-author { font-weight: 700; color: var(--text2); }
+.cc-reply-date { color: var(--text3); font-family: 'JetBrains Mono', monospace; }
+.cc-reply-text { font-size: 12px; color: var(--text); line-height: 1.4; }
+
+.cc-reply-input-wrap {
+    display: flex; gap: 6px; margin-top: 10px;
+}
+.cc-reply-input {
+    flex: 1; border: 1.5px solid var(--border); border-radius: 6px;
+    padding: 6px 10px; font-size: 12px; outline: none; transition: 0.2s;
+}
+.cc-reply-input:focus { border-color: var(--blue); }
+.cc-reply-btn {
+    background: var(--blue-light); color: var(--blue); border: none;
+    border-radius: 6px; padding: 0 12px; font-size: 11.5px; font-weight: 600;
+    cursor: pointer; transition: 0.2s;
+}
+.cc-reply-btn:hover { background: var(--blue); color: white; }
