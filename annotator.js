@@ -1,6 +1,6 @@
 /* =============================================================
    — Annotation Utility  |  tbits
-   File   : annotator.js
+     File   : annotator.js
    - Added Page State Caching & Hierarchy (IRT)
    ============================================================= */
 
@@ -17,9 +17,10 @@ function escapeHTML(str) {
 }
 
 // ── STATE ──
-let currentUser      = 'Reviewer';
-let currentUserId    = 'user_local_001'; 
-let currentUserEmail = 'reviewer@tbits.com';
+let currentUser      = 'nitish-test';
+let currentUserId    = '007'; 
+let currentUserEmail = 'test@tbits.com';
+let currentDocumentId = 'DOC-test-123';
 
 let canvas;
 let fileType         = 'image';
@@ -46,6 +47,10 @@ let isFileLoaded = false;
 // ═══════════════════════════════════════════════════════════════
 window.addEventListener('DOMContentLoaded', () => {
     initializeUserIdentity();
+  
+    //Document ID inilization logic here 
+
+
     canvas = new fabric.Canvas('doc-canvas', { selection: true });
     canvas.setWidth(800);
     canvas.setHeight(600);
@@ -159,7 +164,7 @@ function initializeUserIdentity() {
     if (headerUserNameElement && headerUserNameElement.innerText) {
         currentUser = headerUserNameElement.innerText.trim();
         
-        // Agar ID navbar mein nahi hai, toh naam se hi ek dummy ID bana lo
+        //
         const headerUserIdElement = document.getElementById('header-user-id');
         currentUserId = headerUserIdElement ? headerUserIdElement.innerText.trim() : currentUser.toLowerCase().replace(/\s+/g, '_');
         
@@ -1065,6 +1070,7 @@ function getAnnotationsJSON() {
     }
 
     return {
+        documentId: currentDocumentId,
         documentName: fileName,
         exportedAt:   new Date().toISOString(),
         reviewer:     { id: currentUserId, name: currentUser },
