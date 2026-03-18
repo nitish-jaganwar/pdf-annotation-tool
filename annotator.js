@@ -1,8 +1,9 @@
-/* =============================================================
-   — Annotation Utility  |  tbits
-     File   : annotator.js
-   - Added Page State Caching & Hierarchy (IRT)
-   ============================================================= */
+
+// ═══════════════════════════════════════════════════════════════
+// ⚙️ CONFIGURATION (Update these before Production Deployment)
+// ═══════════════════════════════════════════════════════════════
+const API_BASE_URL = 'http://localhost:8080/annotation-application'; // Change to Render URL in Prod 
+const WS_BASE_URL  = 'ws://localhost:8080/annotation-application';   // Change to wss://api.myapp.com in Prod
 
 // ── CONSTANTS ──
 const PALETTE = ['#ffffff', '#f04f5a','#f97316','#eab308','#18b87d','#0ea5e9','#3b6ef8','#8b5cf6','#ec4899','#1a2140','#8b96b8'];
@@ -16,12 +17,13 @@ function escapeHTML(str) {
     }[tag] || tag));
 }
 
-// ── STATE ──
+// ── STATE VARIABLES ──
 let currentUser      = 'nitish-test';
 let currentUserId    = '007'; 
 let currentUserEmail = 'test@tbits.com';
 let currentDocumentId = 'DOC-test-123';
 
+let nativeWs = null; 
 let canvas;
 let fileType         = 'image';
 let fileName         = 'Document';
@@ -37,20 +39,34 @@ let pdfDoc           = null;
 let pageNum          = 1;
 let totalPages       = 1;
 let originalPdfBytes = null;
-
+let pageCanvasStates = {};
 let deletedImportedSignatures = new Set();
 let pageData = {};
 let isFileLoaded = false;
+let autoSaveTimer = null; // Used for smart debounced saving
 
 // ═══════════════════════════════════════════════════════════════
-// SECTION 1 — BOOTSTRAP
+// SECTION 1 — BOOTSTRAP & INITIALIZATION
 // ═══════════════════════════════════════════════════════════════
 window.addEventListener('DOMContentLoaded', () => {
-    initializeUserIdentity();
-  
-    //Document ID inilization logic here 
+    
+    // 1. Extract Document ID and User from URL (Fallback for local testing)
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.has('docId')) {
+        currentDocumentId = urlParams.get('docId');
+    }
+    
+    if (urlParams.has('user')) {
+        currentUser = urlParams.get('user');
+        currentUserId = currentUser.toLowerCase();
+    } else {
+        // Use standard Auth logic (JWT/Headers) if no URL params
+        initializeUserIdentity(); 
+    }
 
+    console.log(`👤 Current User: ${currentUser} | 📄 Document: ${currentDocumentId}`);
 
+    connectWebSocket();    
     canvas = new fabric.Canvas('doc-canvas', { selection: true });
     canvas.setWidth(800);
     canvas.setHeight(600);
@@ -69,49 +85,456 @@ window.addEventListener('DOMContentLoaded', () => {
     setupDragDrop();
     setupButtons();
 
-    // Safely check if the element exists before adding event listener
-    const userNameInput = document.getElementById('user-name-input');
-    if (userNameInput) {
-        userNameInput.addEventListener('keydown', e => {
-            if (e.key === 'Enter')  confirmUserName();
-            if (e.key === 'Escape') closeUserModal();
-        });
-    }
-
     renderList();
+
+    // Small delay to ensure UI is fully mounted before loading data
+    setTimeout(loadFromServer, 500);
 });
 
+// ═══════════════════════════════════════════════════════════════
+// SECTION 2 — NATIVE WEBSOCKET CONNECTION
+// ═══════════════════════════════════════════════════════════════
+function connectWebSocket() {
+    const wsUrl = `${WS_BASE_URL}/ws-annotator/${currentDocumentId}`;
+    nativeWs = new WebSocket(wsUrl);
 
+    nativeWs.onopen = function () {
+        console.log(`✅ Connected to WebSocket: ${wsUrl}`);
+    };
+
+    nativeWs.onmessage = function (event) {
+        const receivedData = JSON.parse(event.data);
+        
+        // Ignore self-broadcasts
+        if (receivedData.sender !== currentUser) {
+            console.log("📥 Incoming update from: " + receivedData.sender);
+
+            if (receivedData.action === 'ADD' || receivedData.action === 'UPDATE') {
+                const incomingAnno = receivedData.shapeData.annotation;
+                const incomingFabricJson = receivedData.shapeData.fabricShape;
+                
+                // Update State
+                const existingIndex = annotations.findIndex(a => a.id === incomingAnno.id);
+                if (existingIndex > -1) {
+                    annotations[existingIndex] = incomingAnno;
+                } else {
+                    annotations.push(incomingAnno);
+                }
+                
+                annoCounter = Math.max(annoCounter, (incomingAnno.number || 0) + 1);
+
+                // Update Canvas
+                if (incomingFabricJson) {
+                    fabric.util.enlivenObjects([incomingFabricJson], function(objects) {
+                        const newObj = objects[0];
+                        const existingObj = canvas.getObjects().find(o => o.id === newObj.id);
+                        if (existingObj) canvas.remove(existingObj); // Remove old shape if updating
+                        
+                        canvas.add(newObj);
+                        canvas.renderAll();
+                        renderBadges();
+                        renderList(); 
+                        updateJsonState(); 
+                        toast(`Update from ${receivedData.sender}`, '✨');
+                    });
+                }
+            }
+        }
+    };
+
+    nativeWs.onclose = function () {
+        console.warn('❌ WebSocket Connection Lost. Reconnecting in 5 seconds...');
+        if (!nativeWs._manualClose) {
+            setTimeout(connectWebSocket, 5000);
+        }
+    };
+
+    nativeWs.onerror = function (error) {
+        console.error('❌ WebSocket Error:', error);
+    };
+}
+
+function broadcastAnnotationChange(action, annoObj) {
+    if (!nativeWs || nativeWs.readyState !== 1) return;
+
+    const fabricObj = canvas.getObjects().find(o => o.id === annoObj.id);
+    let fabricJson = null;
+    if (fabricObj) {
+        fabricJson = fabricObj.toJSON(['id', 'transparentCorners', 'cornerColor', 'cornerSize', 'borderColor']);
+    }
+
+    const messagePayload = {
+        documentId: currentDocumentId,
+        action: action,
+        sender: currentUser,
+        shapeData: { annotation: annoObj, fabricShape: fabricJson }
+    };
+    nativeWs.send(JSON.stringify(messagePayload));
+}
 
 // ═══════════════════════════════════════════════════════════════
-// SECTION 2 — FULL STATE RESET
+// SECTION 3 — SMART AUTO-SAVE (Event Driven)
+// ═══════════════════════════════════════════════════════════════
+// This prevents spamming the server. It waits 1 second after user stops acting.
+function triggerAutoSave() {
+    if (autoSaveTimer) clearTimeout(autoSaveTimer);
+    autoSaveTimer = setTimeout(() => {
+        handleSaveToServer();
+    }, 1000); 
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 4 — SERVER COMMUNICATION (SAVE/LOAD APIs)
+// ═══════════════════════════════════════════════════════════════
+// async function handleSaveToServer() {
+//     // ⚠️ DO NOT discardActiveObject() here! It ruins UX during auto-save.
+    
+//     // Temporarily remove background to save JSON payload size
+//     const bgImage = canvas.backgroundImage;
+//     canvas.backgroundImage = null;
+    
+//     const fullState = {
+//         annotations: annotations,
+//         annoCounter: annoCounter,
+//         canvasData: canvas.toJSON(['id', 'transparentCorners', 'cornerColor', 'cornerSize', 'borderColor'])
+//     };
+    
+//     // Restore background immediately
+//     canvas.backgroundImage = bgImage;
+//     canvas.renderAll();
+    
+//     const SERVER_URL = `${API_BASE_URL}/api/annotations/save/${currentDocumentId}`;
+    
+//     try {
+//         const response = await fetch(SERVER_URL, {
+//             method: 'POST',
+//             headers: { 'Content-Type': 'application/json' },
+//             body: JSON.stringify(fullState)
+//         });
+        
+//         if (response.ok) {
+//             console.log("☁ Auto-saved to database");
+//         } else {
+//             console.error(`Server error ${response.status}`);
+//         }
+//     } catch (err) {
+//         console.error('Save failed: ' + err.message);
+//     }
+// }
+
+async function handleSaveToServer() {
+    // DO NOT discardActiveObject() here! It ruins UX during auto-save.
+    
+    // Temporarily remove background to save JSON payload size
+    const bgImage = canvas.backgroundImage;
+    canvas.backgroundImage = null;
+    
+    //MULTI-PAGE FIX STEP 1: Current page  forcefully insert in memory 
+    if (typeof pageCanvasStates !== 'undefined' && canvas) {
+        pageCanvasStates[pageNum] = canvas.toJSON(['id', 'transparentCorners', 'cornerColor', 'cornerSize', 'borderColor']);
+    }
+
+    //MULTI-PAGE FIX STEP 2: get annotation coordinates from  memory 
+    annotations.forEach(a => {
+        let targetPage = a.page || 1;
+        // Memory me se us page ka data nikalo
+        let pageData = pageCanvasStates[targetPage]; 
+        
+        if (pageData && pageData.objects) {
+            // Us page par yeh wala box/shape dhoondo
+            let shape = pageData.objects.find(o => o.id === a.id);
+            if (shape) {
+                // Mil gaya! Ab uske coordinates annotation object mein chipka do
+                a.left = shape.left;
+                a.top = shape.top;
+                a.width = shape.width;
+                a.height = shape.height;
+                a.scaleX = shape.scaleX || 1;
+                a.scaleY = shape.scaleY || 1;
+            }
+        }
+    });
+    
+    const fullState = {
+        annotations: annotations, // ✅ Ab isme har page ke coordinates hain!
+        annoCounter: annoCounter,
+        // Hum poori memory DB ko bhej rahe hain taaki next time saare pages load ho sakein
+        canvasData: canvas.toJSON(['id', 'transparentCorners', 'cornerColor', 'cornerSize', 'borderColor']),
+        pageStates: typeof pageCanvasStates !== 'undefined' ? pageCanvasStates : {} 
+    };
+    
+    // Restore background immediately
+    canvas.backgroundImage = bgImage;
+    canvas.renderAll();
+    
+    const SERVER_URL = `${API_BASE_URL}/api/annotations/save/${currentDocumentId}`;
+    
+    try {
+        const response = await fetch(SERVER_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(fullState)
+        });
+        
+        if (response.ok) {
+            console.log("☁ Auto-saved to database");
+        } else {
+            console.error(`Server error ${response.status}`);
+        }
+    } catch (err) {
+        console.error('Save failed: ' + err.message);
+    }
+}
+
+// async function loadFromServer() {
+//     const FILE_URL = `${API_BASE_URL}/api/annotations/file/${currentDocumentId}`;
+//     const JSON_URL = `${API_BASE_URL}/api/annotations/load/${currentDocumentId}`;
+
+//     try {
+//         // STEP 1: Fetch Original File
+//         const fileResponse = await fetch(FILE_URL);
+//         if (fileResponse.ok) {
+//             const blob = await fileResponse.blob();
+//             const file = new File([blob], `${currentDocumentId}.pdf`, { type: 'application/pdf' });
+
+//             await processFile(file); 
+
+//             isFileLoaded = true;
+//             document.getElementById('empty-state').style.display = 'none';
+//             document.getElementById('scroll-container').style.display = 'block';
+//         }
+
+//         // STEP 2: Fetch JSON Metadata (Delay mapping by 1 sec to avoid race conditions with PDF renderer)
+//         const jsonResponse = await fetch(JSON_URL);
+//         const data = await jsonResponse.json();
+
+//         setTimeout(() => {
+//             if (data && data.canvasData && data.canvasData.objects) {
+//                 annotations = data.annotations || [];
+//                 annoCounter = data.annoCounter || 1;
+
+//                 fabric.util.enlivenObjects(data.canvasData.objects, function(objects) {
+//                     objects.forEach(function(obj) {
+//                         canvas.add(obj); 
+//                     });
+//                     canvas.renderAll();
+//                     renderBadges();
+//                     renderList();
+//                     updateJsonState();
+//                     toast('Annotations mapped on PDF!', '📥');
+//                 });
+//             }
+//         }, 1000); 
+//     } catch (err) {
+//         console.error("Error loading data:", err);
+//     }
+// }
+async function loadFromServer() {
+    const FILE_URL = `${API_BASE_URL}/api/annotations/file/${currentDocumentId}`;
+    const JSON_URL = `${API_BASE_URL}/api/annotations/load/${currentDocumentId}`;
+
+    try {
+        // STEP 1: Fetch Original File
+        const fileResponse = await fetch(FILE_URL);
+        if (fileResponse.ok) {
+            const blob = await fileResponse.blob();
+            const file = new File([blob], `${currentDocumentId}.pdf`, { type: 'application/pdf' });
+
+            await processFile(file); 
+
+            isFileLoaded = true;
+            document.getElementById('empty-state').style.display = 'none';
+            document.getElementById('scroll-container').style.display = 'block';
+        }
+
+        // STEP 2: Fetch JSON Metadata
+        const jsonResponse = await fetch(JSON_URL);
+        const data = await jsonResponse.json();
+
+        setTimeout(() => {
+            if (data) {
+                // 1. Comments aur counter load karo
+                annotations = data.annotations || [];
+                annoCounter = data.annoCounter || 1;
+
+                // 🚀 CRITICAL FIX 1: Server se Memory (pageStates) wapas JS mein load karo
+                if (data.pageStates) {
+                    pageCanvasStates = data.pageStates;
+                    
+                    // 🚀 CRITICAL FIX 2: Download/Summary features ke liye pageData ko bhi zinda karo
+                    for (const [pStr, pState] of Object.entries(pageCanvasStates)) {
+                        pageData[pStr] = {
+                            annotations: annotations.filter(a => a.page === parseInt(pStr)),
+                            annoCounter: annoCounter,
+                            canvasData: pState
+                        };
+                    }
+                } else if (data.canvasData) {
+                    // Agar koi purani DB entry hai jisme pageStates nahi tha, toh usko page 1 maan lo
+                    pageCanvasStates[1] = data.canvasData;
+                }
+
+                // 2. Current Page (default Page 1) ki drawing ko Canvas par draw karo
+                const currentPageState = pageCanvasStates[pageNum];
+                
+                if (currentPageState && currentPageState.objects && currentPageState.objects.length > 0) {
+                    // fabric.util.enlivenObjects(currentPageState.objects, function(objects) {
+                    //     // Naye objects dalne se pehle canvas saaf karo taki duplicate na banein
+                    //     canvas.getObjects().forEach(obj => {
+                    //         if (!obj.isType('image')) canvas.remove(obj); 
+                    //     });
+                        
+                    
+                      fabric.util.enlivenObjects(currentPageState.objects, function(objects) {
+                        
+                        // 🚀 BUG FIX: Purane boxes ko sahi tareeqe se hatana (Taki old annotations fass na jayein)
+                        const objectsToRemove = canvas.getObjects().filter(obj => obj.type !== 'image');
+                        objectsToRemove.forEach(obj => canvas.remove(obj));
+                        
+                        // Objects add karo
+                        objects.forEach(function(obj) {
+                            canvas.add(obj); 
+                        });
+                        
+                        canvas.renderAll();
+                        renderBadges();
+                        renderList();
+                        updateJsonState();
+                
+                        toast('Annotations mapped on PDF!', '📥');
+                    });
+                } else {
+                    // Agar page 1 par kuch draw nahi hai, toh bas UI render kardo
+                    renderList();
+                    renderBadges();
+                    updateJsonState();
+                }
+            }
+        }, 1000); 
+    } catch (err) {
+        console.error("Error loading data:", err);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 5 — USER IDENTITY
+// ═══════════════════════════════════════════════════════════════
+// function initializeUserIdentity() {
+//     const token = localStorage.getItem('app_token'); 
+    
+//     if (token) {
+//         try {
+//             const payload = JSON.parse(atob(token.split('.')[1])); 
+//             currentUser      = payload.name || payload.fullName || 'Reviewer';
+//             currentUserId    = payload.sub || payload.userId || 'guest';
+//             currentUserEmail = payload.email || '';
+//             return; 
+//         } catch (error) {
+//             console.warn('⚠️ Invalid JWT Token, falling back...');
+//         }
+//     }
+
+//     const headerUserNameElement = document.getElementById('header-user-name');
+//     if (headerUserNameElement && headerUserNameElement.innerText) {
+//         currentUser = headerUserNameElement.innerText.trim();
+//         const headerUserIdElement = document.getElementById('header-user-id');
+//         currentUserId = headerUserIdElement ? headerUserIdElement.innerText.trim() : currentUser.toLowerCase().replace(/\s+/g, '_');
+//         return;
+//     }
+//     console.log('⚠️ No identity found. Defaulting to Guest.');
+// }
+function initializeUserIdentity() {
+
+    currentUser = "Guest";
+    currentUserId = "guest";
+    currentUserEmail = "";
+
+    // 1️. JWT token stored in localStorage
+    const token = localStorage.getItem("app_token");
+
+    if (token) {
+        try {
+            const payload = JSON.parse(atob(token.split(".")[1]));
+
+            currentUser =
+                payload.name ||
+                payload.preferred_username ||
+                payload.fullName ||
+                "Reviewer";
+
+            currentUserId =
+                payload.sub ||
+                payload.userId ||
+                payload.username ||
+                "guest";
+
+            currentUserEmail = payload.email || "";
+
+            console.log("✅ Identity from JWT");
+            return;
+
+        } catch (e) {
+            console.warn("⚠️ Invalid JWT");
+        }
+    }
+
+    // 2. OIDC client session (oidc-client / oidc-client-ts)
+    if (window.oidcUser && window.oidcUser.profile) {
+
+        const profile = window.oidcUser.profile;
+
+        currentUser =
+            profile.name ||
+            profile.preferred_username ||
+            "Reviewer";
+
+        currentUserId =
+            profile.sub ||
+            profile.username ||
+            "guest";
+
+        currentUserEmail = profile.email || "";
+
+        console.log("✅ Identity from OIDC session");
+        return;
+    }
+
+    // 3️. Security rendered header
+    const nameElement = document.getElementById("header-user-name");
+
+    if (nameElement && nameElement.innerText) {
+
+        currentUser = nameElement.innerText.trim();
+
+        const idElement = document.getElementById("header-user-id");
+
+        currentUserId = idElement
+            ? idElement.innerText.trim()
+            : currentUser.toLowerCase().replace(/\s+/g, "_");
+
+        console.log("✅ Identity from HTML header");
+        return;
+    }
+
+    // 4️⃣ Final fallback
+    console.warn("⚠️ No identity found → Guest");
+}
+// ═══════════════════════════════════════════════════════════════
+// SECTION 6 — FILE LOADING & PDF ENGINE
 // ═══════════════════════════════════════════════════════════════
 function resetState() {
     annotations  = [];
     annoCounter  = 1;
     activeAnnoId = null;
     
-    if (canvas) {
-        canvas.clear();
-        canvas.setZoom(1);
-    }
+    if (canvas) { canvas.clear(); canvas.setZoom(1); }
     currentZoom = 1;
 
-    pdfDoc           = null;
-    pageNum          = 1;
-    totalPages       = 1;
-    originalPdfBytes = null;
-    fileType         = 'image';
-    
-    deletedImportedSignatures.clear();
-    pageData         = {};
+    pdfDoc = null; pageNum = 1; totalPages = 1; originalPdfBytes = null; fileType = 'image';
+    deletedImportedSignatures.clear(); pageData = {};
 
-    hideCommentInput();
-    showNoSel();
-    updateToolbarState(false);
-    renderList();
-    renderBadges();
-    updateJsonState();
+    hideCommentInput(); showNoSel(); updateToolbarState(false);
+    renderList(); renderBadges(); updateJsonState();
 
     document.getElementById('st-dims').textContent     = '—';
     document.getElementById('st-pos').textContent      = 'x:— y:—';
@@ -121,92 +544,12 @@ function resetState() {
 
     const banner = document.getElementById('import-banner');
     if (banner) banner.remove();
-
     const jp = document.getElementById('json-preview-panel');
     if (jp) jp.remove();
     
     isFileLoaded = false;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION 3 — USER IDENTITY
-// ═══════════════════════════════════════════════════════════════
-
-//: Read from Token OR Header 
-function initializeUserIdentity() {
-    // ---------------------------------------------------------
-    // WAY 1: Try reading from JWT Token (Most Secure)
-    // ---------------------------------------------------------
-    const token = localStorage.getItem('app_token'); // 'app_token'  replace with our key name
-    
-    if (token) {
-        try {
-            // JWT Token has 3 parts (Header.Payload.Signature)
-            // we use  (Payload) to  decode 
-            const payload = JSON.parse(atob(token.split('.')[1])); 
-            
-            // Backend JSON keys set karein ( 'name', 'fullName', 'sub')
-            currentUser      = payload.name || payload.fullName || 'Reviewer';
-            currentUserId    = payload.sub || payload.userId || 'guest';
-            currentUserEmail = payload.email || '';
-            
-            console.log('✅ Identity loaded from JWT Token:', currentUser);
-            return; // Agar token mil gaya, toh function yahin rok do
-        } catch (error) {
-            console.warn('⚠️ Invalid JWT Token, falling back to Web Header...', error);
-        }
-    }
-
-    // ---------------------------------------------------------
-    // WAY 2: Fallback to Web Header (DOM Scraping)
-    // ---------------------------------------------------------
-    const headerUserNameElement = document.getElementById('header-user-name');
-    if (headerUserNameElement && headerUserNameElement.innerText) {
-        currentUser = headerUserNameElement.innerText.trim();
-        
-        //
-        const headerUserIdElement = document.getElementById('header-user-id');
-        currentUserId = headerUserIdElement ? headerUserIdElement.innerText.trim() : currentUser.toLowerCase().replace(/\s+/g, '_');
-        
-        console.log('✅ Identity loaded from Web Header:', currentUser);
-        return;
-    }
-
-    // ---------------------------------------------------------
-    // WAY 3: Final Fallback
-    // ---------------------------------------------------------
-    console.log('⚠️ No identity found. Defaulting to Guest/Reviewer.');
-}
-// ═══════════════════════════════════════════════════════════════
-// SECTION 4 — COLOR SWATCHES
-// ═══════════════════════════════════════════════════════════════
-function buildAllSwatches() {
-    buildSwatches(document.getElementById('props-colors'), c => applyColor(c));
-    const ctxWrap = document.getElementById('ctx-colors');
-    PALETTE.forEach(c => {
-        const s = document.createElement('div');
-        s.className = 'ctx-swatch'; s.style.background = c;
-        s.onclick = () => { applyColor(c); hideCtx(); };
-        ctxWrap.appendChild(s);
-    });
-}
-function buildSwatches(container, onPick) {
-    if(!container) return;
-    PALETTE.forEach(c => {
-        const s = document.createElement('div');
-        s.className = 'cswatch'; s.style.background = c;
-        s.onclick = () => {
-            container.querySelectorAll('.cswatch').forEach(x => x.classList.remove('active'));
-            s.classList.add('active');
-            onPick(c);
-        };
-        container.appendChild(s);
-    });
-}
-
-// ═══════════════════════════════════════════════════════════════
-// SECTION 5 — FILE LOADING 
-// ═══════════════════════════════════════════════════════════════
 document.getElementById('file-upload').addEventListener('change', function (e) {
     if (e.target.files[0]) processFile(e.target.files[0]);
     this.value = '';
@@ -244,7 +587,6 @@ function processFile(file) {
                 totalPages = pdfDoc.numPages;
                 pageNum    = 1;
                 await renderPdfPage(pageNum);
-                await recoverAnnotationsFromPdf(pageNum);
             } catch (e) {
                 toast('Failed to load PDF: ' + e.message, '❌');
                 showLoader(false);
@@ -259,150 +601,6 @@ function processFile(file) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION 6 — ANNOTATION RECOGNITION
-// ═══════════════════════════════════════════════════════════════
-async function recoverAnnotationsFromPdf(pageIndex) {
-    if (!pdfDoc) return;
-
-    try {
-        const page  = await pdfDoc.getPage(pageIndex);
-        const vp    = page.getViewport({ scale: 1.5 }); // for clear view
-        const annots = await page.getAnnotations();
-
-        const textAnnots = annots.filter(a => a.subtype === 'Text' || a.annotationType === 1);
-        if (!textAnnots.length) return;
-
-        const parents = [];
-        const repliesRaw = [];
-        textAnnots.forEach(a => a.inReplyTo ? repliesRaw.push(a) : parents.push(a));
-
-        const idMapping = {}; 
-        let recovered = 0;
-
-        for (const raw of parents) {
-            let text = raw.contentsObj?.str || raw.contents || '';
-            const author = raw.titleObj?.str || raw.title || 'Unknown';
-            let type = raw.titleObj?.str ? (raw.subject || 'Comment') : 'Comment';
-
-            const typeMatch = text.match(/^#\d+\s+\[([^\]]+)\]/);
-            if (typeMatch) {
-                type = typeMatch[1]; 
-                const authorIndex = text.indexOf('by ' + author);
-                if (authorIndex !== -1) {
-                    const cutPos = authorIndex + ('by ' + author).length;
-                    text = text.substring(cutPos).trim();
-                } else {
-                    const firstNewLine = text.indexOf('\n');
-                    if (firstNewLine !== -1) text = text.substring(firstNewLine + 1).trim();
-                }
-            }
-
-            const rect = raw.rect; 
-            if (!rect || rect.length < 4) continue;
-
-            const pdfPageH = vp.height / 1.5;
-            const cx = rect[0] * 1.5;
-            const cy = (pdfPageH - rect[3]) * 1.5;
-            const cw = Math.max((rect[2] - rect[0]) * 1.5, 40);
-            const ch = Math.max((rect[3] - rect[1]) * 1.5, 40);
-
-            const sig = Math.round(cx) + '_' + Math.round(cy); 
-            if (deletedImportedSignatures?.has && deletedImportedSignatures.has(sig)) continue;  
-
-            const pdfColor = raw.color;
-            let hexColor = '#3b6ef8';
-            if (pdfColor && pdfColor.length === 3) {
-                hexColor = '#' + pdfColor.map(v => Math.round(v * 255).toString(16).padStart(2, '0')).join('');
-            }
-
-            let fabricFill = 'transparent';
-            if (hexColor !== '#ffffff') {
-                const r = parseInt(hexColor.slice(1, 3), 16);
-                const g = parseInt(hexColor.slice(3, 5), 16);
-                const b = parseInt(hexColor.slice(5, 7), 16);
-                if (!isNaN(r) && !isNaN(g) && !isNaN(b)) {
-                    fabricFill = `rgba(${r}, ${g}, ${b}, 0.1)`;
-                }
-            }
-
-            const marker = new fabric.Rect({
-                left: cx, top: cy, width: cw, height: ch,
-                stroke: hexColor, strokeWidth: 2, strokeDashArray: [6, 3],
-                fill: fabricFill, transparentCorners: false,
-                cornerColor: '#3b6ef8', cornerSize: 8, borderColor: '#3b6ef8',
-            });
-
-            const id = 'imported-' + Date.now() + '-' + recovered;
-            marker.id = id;
-            canvas.add(marker);
-            idMapping[raw.id] = id; 
-            const now = new Date().toISOString();
-
-            annotations.push({
-                id, number: annoCounter++, 
-                type: type, 
-                text: text, isDraft: false, color: hexColor, fabricType: 'rect',
-                isImported: true, signature: sig, 
-                
-                // Tier 2 Mapping
-                createdBy: { id: 'imported', name: author, email: '' },
-                createdAt: now,
-                date: new Date().toLocaleString(),
-                lastEditedBy: null, lastEditedAt: null, editHistory: [], replies: []
-            });
-            recovered++;
-        }
-
-        for (const rep of repliesRaw) {
-            const parentCustomId = idMapping[rep.inReplyTo];
-            if (!parentCustomId) continue; 
-            
-            const parentObj = annotations.find(a => a.id === parentCustomId);
-            if (parentObj) {
-                const repAuthor = rep.titleObj?.str || rep.title || 'Reviewer';
-                parentObj.replies.push({
-                    id: 'rep-imp-' + Date.now() + Math.random(),
-                    createdBy: { id: 'imported', name: repAuthor, email: '' },
-                    createdAt: new Date().toISOString(),
-                    date: new Date().toLocaleString(),
-                    text: rep.contentsObj?.str || rep.contents || '',
-                    isImported: true
-                });
-            }
-        }
-
-        canvas.renderAll();
-        renderList();
-        renderBadges();
-        updateJsonState();
-
-        if (recovered > 0) showImportBanner(recovered);
-
-    } catch (err) {
-        console.warn('Annotation recovery skipped:', err.message);
-    }
-}
-
-function showImportBanner(count) {
-    const existing = document.getElementById('import-banner');
-    if (existing) existing.remove();
-
-    const banner = document.createElement('div');
-    banner.id = 'import-banner';
-    banner.innerHTML = `
-        <span class="import-banner-icon">📥</span>
-        <span><strong>${count} existing annotation${count > 1 ? 's' : ''}</strong> were recovered from this PDF and shown below.
-        You can edit, delete, or add more.</span>
-        <button class="import-banner-close" onclick="document.getElementById('import-banner').remove()">✕</button>`;
-
-    const wrapper = document.getElementById('canvas-wrapper');
-    wrapper.insertBefore(banner, wrapper.querySelector('#scroll-container'));
-}
-
-// ═══════════════════════════════════════════════════════════════
-// SECTION 7 — PDF PAGE RENDERING & CACHING
-// ═══════════════════════════════════════════════════════════════
 async function renderPdfPage(n) {
     showLoader(true);
     const page = await pdfDoc.getPage(n);
@@ -427,44 +625,6 @@ function updatePageNav() {
     document.getElementById('btn-next').disabled        = pageNum >= totalPages;
 }
 
-async function changePage(dir) {
-    const np = pageNum + dir;
-    if (np < 1 || np > totalPages) return;
-
-    pageData[pageNum] = {
-        annotations: [...annotations],
-        annoCounter: annoCounter,
-        canvasData: canvas.toJSON(['id', 'transparentCorners', 'cornerColor', 'cornerSize', 'borderColor'])
-    };
-
-    pageNum = np;
-    
-    hideCommentInput(); showNoSel(); updateToolbarState(false);
-    const banner = document.getElementById('import-banner');
-    if (banner) banner.remove();
-
-    await renderPdfPage(pageNum);
-
-    if (pageData[pageNum]) {
-        annotations = pageData[pageNum].annotations;
-        annoCounter = pageData[pageNum].annoCounter;
-        
-        canvas.loadFromJSON(pageData[pageNum].canvasData, function() {
-            canvas.renderAll();
-            renderList();
-            renderBadges();
-            updateJsonState();
-        });
-    } else {
-        annotations = []; 
-        annoCounter = 1;
-        await recoverAnnotationsFromPdf(pageNum);
-        renderList();
-        renderBadges();
-        updateJsonState();
-    }
-}
-
 function loadFabric(dataUrl) {
     return new Promise(resolve => {
         fabric.Image.fromURL(dataUrl, img => {
@@ -483,12 +643,35 @@ function loadFabric(dataUrl) {
         });
     });
 }
-
 function showLoader(v) { document.getElementById('loader').style.display = v ? 'flex' : 'none'; }
 
 // ═══════════════════════════════════════════════════════════════
-// SECTION 8 — TOOL SELECTION
+// SECTION 7 — DRAWING & TOOLS
 // ═══════════════════════════════════════════════════════════════
+function buildAllSwatches() {
+    buildSwatches(document.getElementById('props-colors'), c => applyColor(c));
+    const ctxWrap = document.getElementById('ctx-colors');
+    PALETTE.forEach(c => {
+        const s = document.createElement('div');
+        s.className = 'ctx-swatch'; s.style.background = c;
+        s.onclick = () => { applyColor(c); hideCtx(); };
+        ctxWrap.appendChild(s);
+    });
+}
+function buildSwatches(container, onPick) {
+    if(!container) return;
+    PALETTE.forEach(c => {
+        const s = document.createElement('div');
+        s.className = 'cswatch'; s.style.background = c;
+        s.onclick = () => {
+            container.querySelectorAll('.cswatch').forEach(x => x.classList.remove('active'));
+            s.classList.add('active');
+            onPick(c);
+        };
+        container.appendChild(s);
+    });
+}
+
 function setupTools() {
     document.querySelectorAll('.tool-btn[data-tool]').forEach(b =>
         b.addEventListener('click', () => activateTool(b.dataset.tool))
@@ -518,9 +701,6 @@ function activateTool(tool) {
     hideCtx();
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION 9 — DRAWING ON CANVAS
-// ═══════════════════════════════════════════════════════════════
 function setupDrawing() {
     canvas.on('mouse:move', o => {
         const p = canvas.getPointer(o.e);
@@ -601,6 +781,21 @@ function setupDrawing() {
     });
 
     canvas.on('after:render', () => renderBadges());
+    
+    // Auto-save triggers on modification
+    // canvas.on('object:modified', () => triggerAutoSave());
+    // Auto-save AND Live Broadcast triggers on modification (Move/Resize)
+    canvas.on('object:modified', (e) => {
+        triggerAutoSave();
+        
+        // 🚀 NEW FIX 2: if any one  move box ,then live sync 
+        if (e.target && e.target.id) {
+            const modifiedAnno = annotations.find(a => a.id === e.target.id);
+            if (modifiedAnno) {
+                broadcastAnnotationChange('UPDATE', modifiedAnno);
+            }
+        }
+    });
 }
 
 function finalizeAnno(obj, type) {
@@ -609,27 +804,48 @@ function finalizeAnno(obj, type) {
     obj.id = id;
     const now = new Date().toISOString();
     
+    // annotations.push({
+    //     id, number: annoCounter++, 
+    //     type: TYPE_LABELS[type] || type,
+    //     date: new Date().toLocaleString(),
+    //     text: '', isDraft: true, color: currentColor, fabricType: type,
     annotations.push({
         id, number: annoCounter++, 
         type: TYPE_LABELS[type] || type,
+        page: pageNum, // 🚀 FIX 1: JSON ko ab pata chalega comment kis page ka hai
         date: new Date().toLocaleString(),
         text: '', isDraft: true, color: currentColor, fabricType: type,
         isImported: false,
-        // Enterprise Identity Fields
         createdBy: { id: currentUserId, name: currentUser, email: currentUserEmail },
         createdAt: now,
-        lastEditedBy: null,
-        lastEditedAt: null,
-        editHistory: [],
-        replies: [] 
+        lastEditedBy: null, lastEditedAt: null, editHistory: [], replies: [] 
     });
     canvas.setActiveObject(obj);
     showCommentInput(id, true);
     updateJsonState();
+    triggerAutoSave();
+
+
+    const newAnno = {
+        id, number: annoCounter++, 
+        type: TYPE_LABELS[type] || type,
+        page: pageNum, 
+        date: new Date().toLocaleString(),
+        isDraft: true,
+        text: '', isDraft: true, color: currentColor, fabricType: type,
+        isImported: false,
+        createdBy: { id: currentUserId, name: currentUser, email: currentUserEmail },
+        createdAt: now,
+        lastEditedBy: null, lastEditedAt: null, editHistory: [], replies: [] 
+    };
+    annotations.push(newAnno);
+   
+    // 🚀 NEW FIX 1: Jaise hi mouse chhode, turant drawing doosri screen par bhej do!
+    broadcastAnnotationChange('ADD', newAnno);
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SECTION 10 — NUMBER BADGES
+// SECTION 8 — COMMENTS & CRUD
 // ═══════════════════════════════════════════════════════════════
 function renderBadges() {
     const layer = document.getElementById('anno-badges');
@@ -646,13 +862,10 @@ function renderBadges() {
         const py = b.top  * z;
 
         const pin = document.createElement('div');
-        pin.className = 'anno-badge' + (a.id === activeAnnoId ? ' active-badge' : '')
-                       + (a.isImported ? ' imported-badge' : '');
+        pin.className = 'anno-badge' + (a.id === activeAnnoId ? ' active-badge' : '') + (a.isImported ? ' imported-badge' : '');
         pin.style.left       = (px - 8) + 'px';
         pin.style.top        = (py - 8) + 'px';
-        pin.style.background = a.isImported
-            ? `linear-gradient(135deg, ${a.color}, #8b5cf6)`
-            : a.color;
+        pin.style.background = a.isImported ? `linear-gradient(135deg, ${a.color}, #8b5cf6)` : a.color;
         pin.style.width  = '20px';
         pin.style.height = '20px';
         pin.style.pointerEvents = 'all';
@@ -672,171 +885,6 @@ function renderBadges() {
     });
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION 11 — OBJECT SELECTION & PROPERTIES
-// ═══════════════════════════════════════════════════════════════
-function updateToolbarState(hasSelection) {
-    const delBtn = document.getElementById('btn-toolbar-delete');
-    if (!delBtn) return;
-    delBtn.classList.toggle('has-selection', hasSelection);
-    delBtn.style.opacity       = hasSelection ? '1'    : '0.35';
-    delBtn.style.pointerEvents = hasSelection ? 'all'  : 'none';
-}
-
-function setupSelection() {
-    canvas.on('selection:created', e => { onSel(e.selected[0]); updateToolbarState(true); });
-    canvas.on('selection:updated', e => { onSel(e.selected[0]); updateToolbarState(true); });
-    canvas.on('selection:cleared', () => { hideCtx(); hideCommentInput(); showNoSel(); updateToolbarState(false); });
-}
-
-function onSel(obj) {
-    if (!obj) return;
-    showPropsPanel(obj);
-    if (obj.id) { activeAnnoId = obj.id; showCommentInput(obj.id, false); }
-    renderBadges();
-}
-
-function showNoSel() {
-    document.getElementById('no-sel').style.display     = 'flex';
-    document.getElementById('props-panel').style.display = 'none';
-    activeAnnoId = null;
-    renderBadges();
-}
-
-function showPropsPanel(obj) {
-    document.getElementById('no-sel').style.display     = 'none';
-    document.getElementById('props-panel').style.display = 'block';
-    const op = Math.round((obj.opacity || 1) * 100);
-    document.getElementById('opacity-slider').value    = op;
-    document.getElementById('opacity-val').textContent = op + '%';
-    const sw = obj.strokeWidth || 2;
-    document.getElementById('stroke-slider').value    = sw;
-    document.getElementById('stroke-val').textContent = sw + 'px';
-}
-
-function applyColor(color) {
-    currentColor = color;
-    const obj = canvas.getActiveObject();
-    if (obj) {
-        if (obj.type === 'group') {
-            obj.getObjects().forEach(c => {
-                if (c.type === 'line')     c.set('stroke', color);
-                if (c.type === 'triangle') c.set('fill',   color);
-            });
-        } else if (obj.type === 'i-text') {
-            obj.set('fill', color);
-        } else {
-            obj.set('stroke', color);
-        }
-        canvas.renderAll();
-        const anno = annotations.find(a => a.id === obj.id);
-        if (anno) { anno.color = color; renderBadges(); }
-    }
-    if (canvas.isDrawingMode) canvas.freeDrawingBrush.color = color;
-    document.getElementById('custom-color').value = color;
-}
-
-function setupSliders() {
-    document.getElementById('custom-color').addEventListener('input', e => applyColor(e.target.value));
-    document.getElementById('opacity-slider').addEventListener('input', e => {
-        const v = parseInt(e.target.value);
-        document.getElementById('opacity-val').textContent = v + '%';
-        const obj = canvas.getActiveObject();
-        if (obj) { obj.set('opacity', v / 100); canvas.renderAll(); }
-    });
-    document.getElementById('stroke-slider').addEventListener('input', e => {
-        const v = parseInt(e.target.value);
-        document.getElementById('stroke-val').textContent = v + 'px';
-        strokeWidth = v;
-        const obj = canvas.getActiveObject();
-        if (!obj) return;
-        if (obj.type === 'group') obj.getObjects().forEach(c => { if (c.type === 'line') c.set('strokeWidth', v); });
-        else obj.set('strokeWidth', v);
-        canvas.renderAll();
-    });
-}
-
-// ═══════════════════════════════════════════════════════════════
-// SECTION 12 — CONTEXT MENU
-// ═══════════════════════════════════════════════════════════════
-function setupContextMenu() {
-    canvas.on('mouse:down', o => {
-        if (o.e.button === 2 && o.target?.id) { o.e.preventDefault(); showCtx(o.e.clientX, o.e.clientY); }
-        else if (o.e.button !== 2) hideCtx();
-    });
-    document.getElementById('canvas-wrapper').addEventListener('contextmenu', e => e.preventDefault());
-    document.addEventListener('click', e => {
-        if (!document.getElementById('context-menu').contains(e.target)) hideCtx();
-    });
-}
-function showCtx(x, y) {
-    const m = document.getElementById('context-menu');
-    m.style.display = 'block'; m.style.left = x + 'px'; m.style.top = y + 'px';
-}
-function hideCtx() { document.getElementById('context-menu').style.display = 'none'; }
-
-window.deleteActiveObject = function () {
-    const obj = canvas.getActiveObject(); if (!obj) return;
-    
-    if (obj.id && obj.id.startsWith('imported-')) {
-        const sigId = obj.id;
-        const matched = annotations.find(a => a.id === sigId);
-        if (matched && matched.signature) deletedImportedSignatures.add(matched.signature);
-    }
-
-    canvas.remove(obj);
-    annotations = annotations.filter(a => a.id !== obj.id);
-    hideCtx(); hideCommentInput(); renderList(); renderBadges(); canvas.renderAll();
-    updateJsonState();
-    toast('Annotation deleted', '🗑');
-};
-
-window.duplicateObject = function () {
-    const obj = canvas.getActiveObject(); if (!obj) return;
-    obj.clone(clone => {
-        clone.set({ left: obj.left + 20, top: obj.top + 20, id: 'anno-' + Date.now() });
-        const orig = annotations.find(a => a.id === obj.id);
-        if (orig) {
-            annotations.push({ 
-                ...orig, 
-                id: clone.id, 
-                number: annoCounter++, 
-                isDraft: false, 
-                isImported: false, 
-                createdBy: { id: currentUserId, name: currentUser, email: currentUserEmail },
-                createdAt: new Date().toISOString(),
-                replies: [] 
-            });
-        }
-        canvas.add(clone); canvas.setActiveObject(clone); canvas.renderAll();
-        renderList(); renderBadges(); updateJsonState();
-    });
-    hideCtx(); toast('Duplicated', '⧉');
-};
-
-window.editActiveComment = function () {
-    const obj = canvas.getActiveObject();
-    if (obj?.id) showCommentInput(obj.id, false);
-    hideCtx();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// SECTION 13 — SIDEBAR TABS
-// ═══════════════════════════════════════════════════════════════
-function setupSidebar() {
-    document.querySelectorAll('.sidebar-tab').forEach(t => {
-        t.addEventListener('click', () => {
-            document.querySelectorAll('.sidebar-tab').forEach(x => x.classList.remove('active'));
-            document.querySelectorAll('.tab-panel').forEach(x => x.classList.remove('active'));
-            t.classList.add('active');
-            document.getElementById('tab-' + t.dataset.tab).classList.add('active');
-        });
-    });
-}
-
-// ═══════════════════════════════════════════════════════════════
-// SECTION 14 — COMMENT INPUT & CARD LIST
-// ═══════════════════════════════════════════════════════════════
 function setupCommentInput() {
     document.getElementById('btn-cancel-input').addEventListener('click', cancelInput);
     document.getElementById('btn-post-input').addEventListener('click', postComment);
@@ -879,8 +927,6 @@ function postComment() {
     const anno = annotations.find(a => a.id === activeAnnoId);
     if (anno) { 
         const now = new Date().toISOString();
-        
-        // History Tracking
         if (!anno.isDraft && anno.text !== val && anno.text !== '') {
             anno.editHistory.push({
                 by: anno.lastEditedBy ? anno.lastEditedBy.name : (anno.createdBy ? anno.createdBy.name : 'Unknown'),
@@ -899,6 +945,9 @@ function postComment() {
     hideCommentInput(); canvas.discardActiveObject(); canvas.renderAll();
     renderBadges(); updateJsonState();
     toast('Comment saved', '💬');
+
+    if (anno) broadcastAnnotationChange('ADD', anno);
+    triggerAutoSave();
 }
 
 window.editComment = id => {
@@ -907,10 +956,30 @@ window.editComment = id => {
     showCommentInput(id, false);
 };
 
+// window.deleteComment = id => {
+//     const obj = canvas.getObjects().find(o => o.id === id);
+//     if (obj) canvas.remove(obj);
+//     annotations = annotations.filter(a => a.id !== id);
+//     canvas.renderAll(); renderList(); renderBadges(); updateJsonState();
+//     toast('Deleted', '🗑');
+//     triggerAutoSave(); // Automatically sync deletion to DB
+// };
+
+// window.deleteActiveObject = function () {
+//     const obj = canvas.getActiveObject(); if (!obj) return;
+//     canvas.remove(obj);
+//     annotations = annotations.filter(a => a.id !== obj.id);
+//     hideCtx(); hideCommentInput(); renderList(); renderBadges(); canvas.renderAll();
+//     updateJsonState();
+//     toast('Annotation deleted', '🗑');
+//     triggerAutoSave(); // Automatically sync deletion to DB
+// };
+
 window.deleteComment = id => {
-    const anno = annotations.find(a => a.id === id);
-    if (anno && anno.isImported && anno.signature) {
-        deletedImportedSignatures.add(anno.signature);
+    // 🚀 NEW FIX: Delete karne se pehle doosre users ko pipe ke zariye batao
+    const annoToDelete = annotations.find(a => a.id === id);
+    if (annoToDelete) {
+        broadcastAnnotationChange('DELETE', annoToDelete);
     }
 
     const obj = canvas.getObjects().find(o => o.id === id);
@@ -918,12 +987,28 @@ window.deleteComment = id => {
     annotations = annotations.filter(a => a.id !== id);
     canvas.renderAll(); renderList(); renderBadges(); updateJsonState();
     toast('Deleted', '🗑');
+    triggerAutoSave(); // Automatically sync deletion to DB
 };
 
+window.deleteActiveObject = function () {
+    const obj = canvas.getActiveObject(); if (!obj) return;
+    
+    // 🚀 NEW FIX: Keyboard se delete (Backspace/Delete) karne par bhi doosro ko batao
+    const annoToDelete = annotations.find(a => a.id === obj.id);
+    if (annoToDelete) {
+        broadcastAnnotationChange('DELETE', annoToDelete);
+    }
+
+    canvas.remove(obj);
+    annotations = annotations.filter(a => a.id !== obj.id);
+    hideCtx(); hideCommentInput(); renderList(); renderBadges(); canvas.renderAll();
+    updateJsonState();
+    toast('Annotation deleted', '🗑');
+    triggerAutoSave(); 
+};
 window.addReply = function(parentId) {
     const input = document.getElementById(`reply-input-${parentId}`);
     if (!input) return;
-    
     const text = input.value.trim();
     if (!text) return;
     
@@ -932,11 +1017,7 @@ window.addReply = function(parentId) {
         if (!parent.replies) parent.replies = [];
         parent.replies.push({
             id: 'rep-' + Date.now(),
-            createdBy: {
-                id: currentUserId,
-                name: currentUser,
-                email: currentUserEmail
-            },
+            createdBy: { id: currentUserId, name: currentUser, email: currentUserEmail },
             createdAt: new Date().toISOString(),
             date: new Date().toLocaleString(),
             text: text,
@@ -944,9 +1025,9 @@ window.addReply = function(parentId) {
         });
         
         input.value = ''; 
-        renderList();
-        updateJsonState();
+        renderList(); updateJsonState();
         toast('Reply added', '💬');
+        triggerAutoSave();
     }
 };
 
@@ -968,9 +1049,7 @@ function renderList() {
         const card = document.createElement('div');
         card.className = 'comment-card' + (a.id === activeAnnoId ? ' active' : '');
 
-        const originTag = a.isImported
-            ? `<span class="cc-origin-tag imported">📥 Imported</span>`
-            : `<span class="cc-origin-tag new">✏ New</span>`;
+        const originTag = a.isImported ? `<span class="cc-origin-tag imported">📥 Imported</span>` : `<span class="cc-origin-tag new">✏ New</span>`;
 
         let repliesHTML = '';
         if (a.replies && a.replies.length > 0) {
@@ -1028,75 +1107,117 @@ function renderList() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SECTION 15 — JSON STATE
+// SECTION 9 — UTILITIES (Zoom, Menus, Properties)
 // ═══════════════════════════════════════════════════════════════
-function getAnnotationsJSON() {
-    pageData[pageNum] = {
-        annotations: [...annotations],
-        annoCounter: annoCounter,
-        canvasData: canvas.toJSON(['id', 'transparentCorners', 'cornerColor', 'cornerSize', 'borderColor'])
-    };
-
-    let allPub = [];
-    for (const [pStr, data] of Object.entries(pageData)) {
-        const pubs = data.annotations.filter(a => !a.isDraft);
-        pubs.forEach(a => {
-            const objData = data.canvasData.objects.find(o => o.id === a.id);
-            allPub.push({
-                id:         a.id,
-                number:     a.number,
-                type:       a.type,
-                color:      a.color,
-                page:       parseInt(pStr),
-                isImported: a.isImported || false,
-                
-                // Enterprise Identity Output
-                createdBy:    a.createdBy || { name: a.author || 'Unknown' },
-                createdAt:    a.createdAt || new Date().toISOString(),
-                lastEditedBy: a.lastEditedBy || null,
-                lastEditedAt: a.lastEditedAt || null,
-                editHistory:  a.editHistory || [],
-                text:         a.text,
-                replies:      a.replies || [],
-                
-                bbox: objData ? {
-                    x:      Math.round(objData.left),
-                    y:      Math.round(objData.top),
-                    width:  Math.round((objData.width || 0) * (objData.scaleX || 1)),
-                    height: Math.round((objData.height || 0) * (objData.scaleY || 1))
-                } : null
-            });
+function setupSidebar() {
+    document.querySelectorAll('.sidebar-tab').forEach(t => {
+        t.addEventListener('click', () => {
+            document.querySelectorAll('.sidebar-tab').forEach(x => x.classList.remove('active'));
+            document.querySelectorAll('.tab-panel').forEach(x => x.classList.remove('active'));
+            t.classList.add('active');
+            document.getElementById('tab-' + t.dataset.tab).classList.add('active');
         });
-    }
-
-    return {
-        documentId: currentDocumentId,
-        documentName: fileName,
-        exportedAt:   new Date().toISOString(),
-        reviewer:     { id: currentUserId, name: currentUser },
-        totalPages,
-        currentPage:  pageNum,
-        annotations:  allPub
-    };
+    });
 }
 
-function updateJsonState() {
-    let totalAnnots = 0;
-    const currentPub = annotations.filter(a => !a.isDraft);
-    totalAnnots += currentPub.length;
-    
-    for (const [pStr, data] of Object.entries(pageData)) {
-        if (parseInt(pStr) !== pageNum) {
-            totalAnnots += data.annotations.filter(a => !a.isDraft).length;
+function setupContextMenu() {
+    canvas.on('mouse:down', o => {
+        if (o.e.button === 2 && o.target?.id) { o.e.preventDefault(); showCtx(o.e.clientX, o.e.clientY); }
+        else if (o.e.button !== 2) hideCtx();
+    });
+    document.getElementById('canvas-wrapper').addEventListener('contextmenu', e => e.preventDefault());
+    document.addEventListener('click', e => {
+        if (!document.getElementById('context-menu').contains(e.target)) hideCtx();
+    });
+}
+function showCtx(x, y) {
+    const m = document.getElementById('context-menu');
+    m.style.display = 'block'; m.style.left = x + 'px'; m.style.top = y + 'px';
+}
+function hideCtx() { document.getElementById('context-menu').style.display = 'none'; }
+
+function updateToolbarState(hasSelection) {
+    const delBtn = document.getElementById('btn-toolbar-delete');
+    if (!delBtn) return;
+    delBtn.classList.toggle('has-selection', hasSelection);
+    delBtn.style.opacity       = hasSelection ? '1'    : '0.35';
+    delBtn.style.pointerEvents = hasSelection ? 'all'  : 'none';
+}
+
+function setupSelection() {
+    canvas.on('selection:created', e => { onSel(e.selected[0]); updateToolbarState(true); });
+    canvas.on('selection:updated', e => { onSel(e.selected[0]); updateToolbarState(true); });
+    canvas.on('selection:cleared', () => { hideCtx(); hideCommentInput(); showNoSel(); updateToolbarState(false); });
+}
+
+function onSel(obj) {
+    if (!obj) return;
+    showPropsPanel(obj);
+    if (obj.id) { activeAnnoId = obj.id; showCommentInput(obj.id, false); }
+    renderBadges();
+}
+
+function showNoSel() {
+    document.getElementById('no-sel').style.display     = 'flex';
+    document.getElementById('props-panel').style.display = 'none';
+    activeAnnoId = null;
+    renderBadges();
+}
+
+function showPropsPanel(obj) {
+    document.getElementById('no-sel').style.display     = 'none';
+    document.getElementById('props-panel').style.display = 'block';
+    const op = Math.round((obj.opacity || 1) * 100);
+    document.getElementById('opacity-slider').value    = op;
+    document.getElementById('opacity-val').textContent = op + '%';
+    const sw = obj.strokeWidth || 2;
+    document.getElementById('stroke-slider').value    = sw;
+    document.getElementById('stroke-val').textContent = sw + 'px';
+}
+
+function applyColor(color) {
+    currentColor = color;
+    const obj = canvas.getActiveObject();
+    if (obj) {
+        if (obj.type === 'group') {
+            obj.getObjects().forEach(c => {
+                if (c.type === 'line')     c.set('stroke', color);
+                if (c.type === 'triangle') c.set('fill',   color);
+            });
+        } else if (obj.type === 'i-text') {
+            obj.set('fill', color);
+        } else {
+            obj.set('stroke', color);
         }
+        canvas.renderAll();
+        const anno = annotations.find(a => a.id === obj.id);
+        if (anno) { anno.color = color; renderBadges(); triggerAutoSave(); }
     }
-    const jsCount = document.getElementById('st-json-count');
-    if (jsCount) jsCount.textContent = `{ } ${totalAnnots} annotation${totalAnnots !== 1 ? 's' : ''}`;
+    if (canvas.isDrawingMode) canvas.freeDrawingBrush.color = color;
+    document.getElementById('custom-color').value = color;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION 16 — ZOOM
-// ═══════════════════════════════════════════════════════════════
+function setupSliders() {
+    document.getElementById('custom-color').addEventListener('input', e => applyColor(e.target.value));
+    document.getElementById('opacity-slider').addEventListener('input', e => {
+        const v = parseInt(e.target.value);
+        document.getElementById('opacity-val').textContent = v + '%';
+        const obj = canvas.getActiveObject();
+        if (obj) { obj.set('opacity', v / 100); canvas.renderAll(); triggerAutoSave(); }
+    });
+    document.getElementById('stroke-slider').addEventListener('input', e => {
+        const v = parseInt(e.target.value);
+        document.getElementById('stroke-val').textContent = v + 'px';
+        strokeWidth = v;
+        const obj = canvas.getActiveObject();
+        if (!obj) return;
+        if (obj.type === 'group') obj.getObjects().forEach(c => { if (c.type === 'line') c.set('strokeWidth', v); });
+        else obj.set('strokeWidth', v);
+        canvas.renderAll();
+        triggerAutoSave();
+    });
+}
+
 function setupZoom() {
     document.getElementById('canvas-wrapper').addEventListener('wheel', e => {
         if (e.ctrlKey || e.metaKey) { e.preventDefault(); e.deltaY < 0 ? zoomIn() : zoomOut(); }
@@ -1104,26 +1225,19 @@ function setupZoom() {
 }
 function zoomIn()    { currentZoom = Math.min(currentZoom + 0.15, 4);   applyZoom(); }
 function zoomOut()   { currentZoom = Math.max(currentZoom - 0.15, 0.2); applyZoom(); }
-function resetZoom() { currentZoom = 1; applyZoom(); }
-
 function applyZoom() {
     canvas.setZoom(currentZoom);
     const baseW = canvas.backgroundImage ? canvas.backgroundImage.width  : 800;
     const baseH = canvas.backgroundImage ? canvas.backgroundImage.height : 600;
     const zW = Math.round(baseW * currentZoom);
     const zH = Math.round(baseH * currentZoom);
-    canvas.setWidth(zW);
-    canvas.setHeight(zH);
+    canvas.setWidth(zW); canvas.setHeight(zH);
     const shadow = document.getElementById('canvas-shadow');
-    shadow.style.width  = zW + 'px';
-    shadow.style.height = zH + 'px';
+    shadow.style.width  = zW + 'px'; shadow.style.height = zH + 'px';
     document.getElementById('zoom-level').textContent = Math.round(currentZoom * 100) + '%';
     renderBadges();
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION 17 — KEYBOARD SHORTCUTS
-// ═══════════════════════════════════════════════════════════════
 function setupKeyboard() {
     const KEYS = { v:'select', p:'draw', r:'rect', e:'circle', a:'arrow', t:'text', l:'line' };
     document.addEventListener('keydown', e => {
@@ -1131,7 +1245,6 @@ function setupKeyboard() {
         if (KEYS[e.key.toLowerCase()])                   { activateTool(KEYS[e.key.toLowerCase()]); return; }
         if (e.key === 'Delete' || e.key === 'Backspace') { if (canvas.getActiveObject()) deleteActiveObject(); return; }
         if ((e.ctrlKey || e.metaKey) && e.key === 'z')  { undoLast(); }
-        if ((e.ctrlKey || e.metaKey) && e.key === 'o')  { e.preventDefault(); document.getElementById('file-upload').click(); }
     });
 }
 
@@ -1141,11 +1254,9 @@ function undoLast() {
     if (last.id) { annotations = annotations.filter(a => a.id !== last.id); renderList(); renderBadges(); updateJsonState(); }
     canvas.remove(last); canvas.renderAll();
     toast('Undone', '↩');
+    triggerAutoSave();
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION 18 — TOAST & PROGRESS
-// ═══════════════════════════════════════════════════════════════
 function toast(msg, icon = '✅', dur = 2500) {
     const el = document.createElement('div');
     el.className = 'toast';
@@ -1153,38 +1264,91 @@ function toast(msg, icon = '✅', dur = 2500) {
     document.getElementById('toast-container').appendChild(el);
     setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 200); }, dur);
 }
-function showProgress(v, title = 'Processing…', sub = 'Please wait') {
-    document.getElementById('progress-bar-wrap').style.display = v ? 'flex' : 'none';
-    document.getElementById('progress-title').textContent      = title;
-    document.getElementById('progress-sub').textContent        = sub;
-    if (!v) document.getElementById('progress-fill').style.width = '0%';
-}
-function setProgress(pct) { document.getElementById('progress-fill').style.width = pct + '%'; }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION 19 — BUTTON WIRING & FALLBACK PREVIEW
-// ═══════════════════════════════════════════════════════════════
 function checkFileLoaded() {
-    if (!isFileLoaded) {
-        toast('Please open a document first!', '⚠️');
-        return false;
-    }
+    if (!isFileLoaded) { toast('Please open a document first!', '⚠️'); return false; }
     return true;
 }
 
 function setupButtons() {
+    // Only used manual buttons (Export/Download PDF)
     document.getElementById('btn-download').addEventListener('click', () => {
-        if (checkFileLoaded()) handleDownload();
+        if (checkFileLoaded()) toast('PDF Export is a Work In Progress', '🚧');
     });
     
     document.getElementById('btn-save-server').addEventListener('click', () => {
         if (checkFileLoaded()) handleSaveToServer();
     });
+}
+
+function updateJsonState() {
+    let totalAnnots = annotations.filter(a => !a.isDraft).length;
+    const jsCount = document.getElementById('st-json-count');
+    if (jsCount) jsCount.textContent = `{ } ${totalAnnots} annotation${totalAnnots !== 1 ? 's' : ''}`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PROGRESS BAR UI FUNCTIONS (Restored)
+// ═══════════════════════════════════════════════════════════════
+function showProgress(v, title = 'Processing…', sub = 'Please wait') {
+    const wrap = document.getElementById('progress-bar-wrap');
+    if (!wrap) return; 
+    wrap.style.display = v ? 'flex' : 'none';
     
+    const titleEl = document.getElementById('progress-title');
+    if (titleEl) titleEl.textContent = title;
+    
+    const subEl = document.getElementById('progress-sub');
+    if (subEl) subEl.textContent = sub;
+    
+    if (!v) {
+        const fillEl = document.getElementById('progress-fill');
+        if (fillEl) fillEl.style.width = '0%';
+    }
+}
+
+function setProgress(pct) { 
+    const fillEl = document.getElementById('progress-fill');
+    if (fillEl) fillEl.style.width = pct + '%'; 
+}
+// ═══════════════════════════════════════════════════════════════
+// SECTION 9 — BUTTON WIRING & JSON PREVIEW
+// ═══════════════════════════════════════════════════════════════
+function checkFileLoaded() {
+    if (!isFileLoaded) { toast('Please open a document first!', '⚠️'); return false; }
+    return true;
+}
+
+function setupButtons() {
+
+document.getElementById('btn-prev').addEventListener('click', () => {
+    if (pageNum > 1) {
+        changePageAndPreserveState(pageNum - 1);
+    }
+});
+
+document.getElementById('btn-next').addEventListener('click', () => {
+    if (pdfDoc && pageNum < pdfDoc.numPages) {
+        changePageAndPreserveState(pageNum + 1);
+    }
+});
+
+    // 1. Download Annotated PDF
+    document.getElementById('btn-download').addEventListener('click', () => {
+        if (checkFileLoaded()) handleDownload();
+    });
+    
+    // 2. Manual Save to Server
+    document.getElementById('btn-save-server').addEventListener('click', () => {
+        if (checkFileLoaded()) handleSaveToServer();
+    });
+    
+    // 3. Export Summary PDF
     document.getElementById('btn-export-summary').addEventListener('click', () => {
         if (checkFileLoaded()) handleSummary();
     });
 
+    // 4. View JSON in UI Panel
     const viewJsonBtn = document.getElementById('btn-view-json');
     if (viewJsonBtn) {
         viewJsonBtn.addEventListener('click', () => {
@@ -1195,6 +1359,7 @@ function setupButtons() {
         });
     }
 
+    // 5. Download JSON File
     const dwnJsonBtn = document.getElementById('btn-download-json');
     if (dwnJsonBtn) {
         dwnJsonBtn.addEventListener('click', () => {
@@ -1203,7 +1368,7 @@ function setupButtons() {
             const jsonData = getAnnotationsJSON();
             const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(jsonData, null, 2));
             const downloadAnchorNode = document.createElement('a');
-            downloadAnchorNode.setAttribute("href",     dataStr);
+            downloadAnchorNode.setAttribute("href", dataStr);
             downloadAnchorNode.setAttribute("download", fileName + "_annotations.json");
             document.body.appendChild(downloadAnchorNode); 
             downloadAnchorNode.click();
@@ -1212,7 +1377,61 @@ function setupButtons() {
         });
     }
 }
+// 3. The Master Page Change Function
+async function changePageAndPreserveState(newPageNum) {
+    
+    // ==========================================
+    // STEP A: SAVE CURRENT PAGE DRAWINGS
+    // ==========================================
+    // if (canvas) {
+    if (canvas) {
+        syncCurrentPage();
+        // PDF Background ko temporarily hatao taaki wo JSON mein save na ho jaye
+        const tempBg = canvas.backgroundImage;
+        canvas.backgroundImage = null; 
+        
+        // Sirf boxes/arrows/comments save karo
+        pageCanvasStates[pageNum] = canvas.toJSON(['id', 'transparentCorners', 'cornerColor', 'borderColor']); 
+        
+        // Background wapas laga do (Just in case)
+        canvas.backgroundImage = tempBg; 
+    }
 
+    // ==========================================
+    // STEP B: UPDATE UI & PAGE NUMBER
+    // ==========================================
+    pageNum = newPageNum;
+    const label = document.getElementById('page-label');
+    if (label) label.textContent = `${pageNum} / ${pdfDoc.numPages}`;
+
+    // ==========================================
+    // STEP C: RENDER NEW PDF PAGE
+    // ==========================================
+    // ⚠️ IMPORTANT: Yahan aapke PDF render karne wale function ka naam aayega. 
+    // Agar aapne uska naam renderPage rakha hai, toh wahi use karein.
+    await renderPdfPage(pageNum); 
+
+    // ==========================================
+    // STEP D: RESTORE NEW PAGE DRAWINGS
+    // ==========================================
+    if (pageCanvasStates[pageNum]) {
+        // Naye PDF page ka background safe rakh lo
+        const newPdfBackground = canvas.backgroundImage;
+
+        // Is page ki purani drawing load karo
+        canvas.loadFromJSON(pageCanvasStates[pageNum], () => {
+            // Drawing load hone ke baad naya background wapas set kar do
+            canvas.backgroundImage = newPdfBackground;
+            canvas.renderAll();
+        });
+    } else {
+        // Agar naye page par kuch draw nahi hua tha, toh pichle page ke boxes hata do
+        // Note: canvas.clear() mat use karna varna PDF udd jayega!
+        const objects = canvas.getObjects();
+        objects.forEach(obj => canvas.remove(obj));
+        canvas.renderAll();
+    }
+}
 function showJsonPreview(payload) {
     const existing = document.getElementById('json-preview-panel');
     if (existing) existing.remove();
@@ -1243,6 +1462,60 @@ function syncCurrentPage() {
     };
 }
 
+function getAnnotationsJSON() {
+    syncCurrentPage();
+    let allPub = [];
+    // for (const [pStr, data] of Object.entries(pageData)) {
+    //     const pubs = data.annotations.filter(a => !a.isDraft);
+    for (const [pStr, data] of Object.entries(pageData)) {
+        // 🚀 FIX 3: Sirf current page ke comments filter karo, warna API crash hogi ya duplicate aayenge
+        const pubs = data.annotations.filter(a => !a.isDraft && (a.page || 1) === parseInt(pStr));
+        pubs.forEach(a => {
+            const objData = data.canvasData.objects.find(o => o.id === a.id);
+            allPub.push({
+                id: a.id, number: a.number, type: a.type, color: a.color,
+                page: parseInt(pStr), isImported: a.isImported || false,
+                createdBy: a.createdBy || { name: a.author || 'Unknown' },
+                createdAt: a.createdAt || new Date().toISOString(),
+                lastEditedBy: a.lastEditedBy || null,
+                lastEditedAt: a.lastEditedAt || null,
+                editHistory: a.editHistory || [],
+                text: a.text, replies: a.replies || [],
+                bbox: objData ? {
+                    x: Math.round(objData.left),
+                    y: Math.round(objData.top),
+                    width: Math.round((objData.width || 0) * (objData.scaleX || 1)),
+                    height: Math.round((objData.height || 0) * (objData.scaleY || 1))
+                } : null
+            });
+        });
+    }
+
+    return {
+        documentId: currentDocumentId,
+        documentName: fileName,
+        exportedAt: new Date().toISOString(),
+        reviewer: { id: currentUserId, name: currentUser },
+        totalPages,
+        currentPage: pageNum,
+        annotations: allPub
+    };
+}
+
+function updateJsonState() {
+    let totalAnnots = annotations.filter(a => !a.isDraft).length;
+    for (const [pStr, data] of Object.entries(pageData)) {
+        if (parseInt(pStr) !== pageNum) {
+            totalAnnots += data.annotations.filter(a => !a.isDraft).length;
+        }
+    }
+    const jsCount = document.getElementById('st-json-count');
+    if (jsCount) jsCount.textContent = `{ } ${totalAnnots} annotation${totalAnnots !== 1 ? 's' : ''}`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 10 — PDF EXPORT & SUMMARY GENERATION
+// ═══════════════════════════════════════════════════════════════
 async function handleDownload() {
     canvas.discardActiveObject(); canvas.renderAll();
     syncCurrentPage();
@@ -1265,49 +1538,18 @@ async function handleDownload() {
     }
 }
 
-async function handleSaveToServer() {
-    canvas.discardActiveObject(); canvas.renderAll();
-    syncCurrentPage();
-
-    showProgress(true, 'Saving to Server…', 'Building PDF and uploading');
-    setProgress(5);
-    try {
-        const pdfBytes    = await buildAnnotatedPdf(p => setProgress(5 + p * 0.70));
-        const jsonPayload = getAnnotationsJSON();
-        setProgress(80);
-
-        const blob     = new Blob([pdfBytes], { type: 'application/pdf' });
-        const formData = new FormData();
-        formData.append('file',        blob,                        `${fileName}_Annotated.pdf`);
-        formData.append('annotations', JSON.stringify(jsonPayload));
-        formData.append('fileName',    fileName);
-        formData.append('reviewer',    currentUser);
-        setProgress(90);
-       
-        const SERVER_URL = 'http://192.168.1.4:8080/api/annotations/save';
-        try {
-            const response = await fetch(SERVER_URL, { method: 'POST', body: formData });
-            setProgress(100);
-            setTimeout(() => showProgress(false), 400);
-            if (response.ok) toast(`Saved to server`, '☁');
-            else toast(`Server error ${response.status}`, '❌', 5000);
-        } catch (_) {
-            showProgress(false);
-            showJsonPreview(jsonPayload);
-            toast('Server unreachable — JSON preview shown', '⚠️', 5000);
-        }
-    } catch (err) {
-        showProgress(false); console.error(err);
-        toast('Save failed: ' + err.message, '❌', 5000);
-    }
-}
-
 async function handleSummary() {
     syncCurrentPage();
     
+    // let allPub = [];
+    // for (const [pStr, data] of Object.entries(pageData)) {
+    //     const pagePub = data.annotations.filter(a => !a.isDraft).map(a => ({...a, page: parseInt(pStr)}));
+    //     allPub.push(...pagePub);
+    // }
     let allPub = [];
     for (const [pStr, data] of Object.entries(pageData)) {
-        const pagePub = data.annotations.filter(a => !a.isDraft).map(a => ({...a, page: parseInt(pStr)}));
+        // 🚀 FIX 4: Summary PDF mein saare pages ke comments mix hone se rokna
+        const pagePub = data.annotations.filter(a => !a.isDraft && (a.page || 1) === parseInt(pStr)).map(a => ({...a, page: parseInt(pStr)}));
         allPub.push(...pagePub);
     }
 
@@ -1334,9 +1576,6 @@ async function handleSummary() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION 20 — PDF EXPORT HELPERS 
-// ═══════════════════════════════════════════════════════════════
 function getPDFLib() {
     const lib = window.PDFLib;
     if (!lib || !lib.PDFDocument) throw new Error('pdf-lib failed to load.');
@@ -1368,6 +1607,7 @@ function toUTF16BEHex(str) {
     return hex;
 }
 
+// Builds the final PDF using pdf-lib (Draws shapes and native PDF comments)
 async function buildAnnotatedPdf(onProgress = () => {}) {
     const lib = getPDFLib();
     const { PDFDocument, PDFName, PDFHexString, PDFString, rgb, StandardFonts } = lib;
@@ -1401,7 +1641,6 @@ async function buildAnnotatedPdf(onProgress = () => {}) {
 
         // Safe Cleanup (Deletes Text AND Popup so Adobe doesn't resurrect them)
         let annotsRef =  pdfPage.node.set(PDFName.of('Annots'), pdfDoc2.context.obj([]));
-       
         let annotsArr;
 
         if (annotsRef) {
@@ -1415,9 +1654,7 @@ async function buildAnnotatedPdf(onProgress = () => {}) {
                         const stRef = annot.get(PDFName.of('Subtype'));
                         const stObj = pdfDoc2.context.lookup(stRef);
                         const subtypeName = stObj ? stObj.name : '';
-                        if (subtypeName === 'Text' || subtypeName === 'Popup') {
-                            continue; 
-                        }
+                        if (subtypeName === 'Text' || subtypeName === 'Popup') continue; 
                     }
                     cleanArr.push(ref);
                 }
@@ -1480,7 +1717,6 @@ async function buildAnnotatedPdf(onProgress = () => {}) {
 
             const dateStr = new Date().toISOString().replace(/[-:.TZ]/g,'').substring(0,14);
             const tinyRect = pdfDoc2.context.obj([badgeX - 10, badgeY - 15, badgeX + 10, badgeY + 5]);
-
             const annoAuthorName = anno.createdBy ? anno.createdBy.name : (anno.author || 'Reviewer');
 
             const annotRef  = pdfDoc2.context.nextRef();

@@ -9,6 +9,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+    
     <script>
         pdfjsLib.GlobalWorkerOptions.workerSrc =
             'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -45,11 +46,16 @@
 
       
 
-        <nav class="page-nav" id="page-nav" style="display:none">
-            <button class="page-nav-btn" id="btn-prev" onclick="changePage(-1)">‹</button>
+        <!-- <nav class="page-nav" id="page-nav" style="display:none">
+            <button class="page-nav-btn" id="btn-prev" onclick="prev()">‹</button>
             <span class="page-label" id="page-label">1 / 1</span>
-            <button class="page-nav-btn" id="btn-next" onclick="changePage(1)">›</button>
-        </nav>
+            <button class="page-nav-btn" id="btn-next" onclick="next()">›</button>
+        </nav> -->
+        <nav class="page-nav" id="page-nav" style="display:none">
+    <button class="page-nav-btn" id="btn-prev">‹</button>
+    <span class="page-label" id="page-label">1 / 1</span>
+    <button class="page-nav-btn" id="btn-next">›</button>
+</nav>
 
         <!-- [FIX 4] Three buttons: Summary · Download · Save -->
         <!-- <div class="topbar-right">
@@ -58,8 +64,8 @@
             <button class="btn btn-blue"         id="btn-save-server"    style="font-size:12.5px">☁ Save</button>
         </div> -->
         <div class="topbar-right">
-    <button class="btn btn-ghost" id="btn-view-json" style="font-size:12.5px">🪟 View JSON</button>
-    <button class="btn btn-ghost" id="btn-download-json" style="font-size:12.5px">📄 Save JSON</button>
+    <!-- <button class="btn btn-ghost" id="btn-view-json" style="font-size:12.5px">🪟 View JSON</button>
+    <button class="btn btn-ghost" id="btn-download-json" style="font-size:12.5px">📄 Save JSON</button> -->
     
     <button class="btn btn-ghost"        id="btn-export-summary" style="font-size:12.5px">📋 Summary</button>
     <button class="btn btn-outline-blue" id="btn-download"       style="font-size:12.5px">⬇ Download</button>
